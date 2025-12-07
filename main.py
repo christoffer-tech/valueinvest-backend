@@ -8,7 +8,7 @@ CORS(app)
 
 @app.route('/')
 def home():
-    return "ValueInvest AI Backend is Running on Railway!"
+    return "ValueInvest AI Backend is Running on Render!"
 
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
@@ -17,7 +17,6 @@ def get_stock(ticker):
         stock = yf.Ticker(ticker)
         
         # 1. Basic Info
-        # fast_info is faster, but info contains the specific keys your frontend expects
         info = stock.info 
         
         # 2. History (2 Years for SMAs)
@@ -44,5 +43,5 @@ def get_stock(ticker):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
