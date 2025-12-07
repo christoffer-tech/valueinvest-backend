@@ -2,9 +2,25 @@ import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 import yfinance as yf
+import pandas as pd
 
 app = Flask(__name__)
 CORS(app)
+
+def sanitize(data):
+    """
+    Recursively convert Pandas Timestamps and other non-JSON types to strings/native types.
+    Fixes 'keys must be str' error.
+    """
+    if isinstance(data, dict):
+        return {str(k): sanitize(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize(v) for v in data]
+    elif isinstance(data, (pd.Timestamp, pd.DatetimeIndex)):
+        return str(data)
+    elif hasattr(data, 'item'):  # Handle numpy float/int types
+        return data.item()
+    return data
 
 @app.route('/')
 def home():
@@ -17,20 +33,28 @@ def get_stock(ticker):
         stock = yf.Ticker(ticker)
         
         # 1. Basic Info
-        info = stock.info 
+        # sanitize() handles potential Timestamps in the info dict
+        info = sanitize(stock.info)
         
         # 2. History (2 Years for SMAs)
         hist = stock.history(period="2y")
         history_list = hist['Close'].tolist() if not hist.empty else []
+        # Convert nan to None for valid JSON
+        history_list = [x if x == x else None for x in history_list] 
         
         # 3. Financials (Safe retrieval)
         financials = {}
         try:
-            financials['income'] = stock.income_stmt.to_dict() if stock.income_stmt is not None else {}
-            financials['balance'] = stock.balance_sheet.to_dict() if stock.balance_sheet is not None else {}
-            financials['cashflow'] = stock.cashflow.to_dict() if stock.cashflow is not None else {}
-        except:
-            pass
+            # .to_dict() on DataFrames often results in Timestamp keys (columns are dates)
+            # sanitize() fixes "keys must be str" error here
+            if stock.income_stmt is not None:
+                financials['income'] = sanitize(stock.income_stmt.to_dict())
+            if stock.balance_sheet is not None:
+                financials['balance'] = sanitize(stock.balance_sheet.to_dict())
+            if stock.cashflow is not None:
+                financials['cashflow'] = sanitize(stock.cashflow.to_dict())
+        except Exception as e:
+            print(f"Financials warning: {e}")
 
         return jsonify({
             "status": "success",
