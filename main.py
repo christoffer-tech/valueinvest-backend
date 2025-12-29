@@ -3,7 +3,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
-from defeatbeta_api.data.ticker import Ticker  # <--- ADDED IMPORT
+from defeatbeta_api.data.ticker import Ticker
+from jp_scraper import scrape_japanese_transcript  # <--- IMPORT THE NEW MODULE
 
 app = Flask(__name__)
 CORS(app)
@@ -26,31 +27,52 @@ def sanitize(data):
 def home():
     return "ValueInvest AI Backend is Running on Render!"
 
-# --- NEW TRANSCRIPT ENDPOINT ---
 @app.route('/api/transcript/<symbol>', methods=['GET'])
 def get_transcript(symbol):
+    
+    # --- 1. JAPANESE STOCK HANDLER ---
+    # Detect if ticker ends in .T or is a 4-digit code (common JP format)
+    if symbol.endswith('.T') or (symbol.isdigit() and len(symbol) == 4):
+        try:
+            print(f"Fetching Japanese transcript for {symbol} via Logmi...")
+            # If user passed just "4414", scrape_japanese_transcript handles adding suffixes if needed
+            transcript_text = scrape_japanese_transcript(symbol)
+            
+            if transcript_text:
+                return jsonify({
+                    "symbol": symbol,
+                    "transcript": transcript_text,
+                    "source": "Logmi (Japan)"
+                })
+            else:
+                return jsonify({"error": "No relevant Japanese transcript/material found"}), 404
+        except Exception as e:
+            print(f"JP Transcript Error: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # --- 2. US STOCK HANDLER (Existing DefeatBeta Logic) ---
     try:
         print(f"Fetching transcript for {symbol}...")
         ticker = Ticker(symbol)
         transcripts = ticker.earning_call_transcripts()
         
-        # 1. Get list of available transcripts
+        # Get list of available transcripts
         available_df = transcripts.get_transcripts_list()
         if available_df is None or available_df.empty:
              return jsonify({"error": "No transcripts found"}), 404
         
-        # 2. Find latest (Sort by Year DESC, then Quarter DESC)
+        # Find latest (Sort by Year DESC, then Quarter DESC)
         latest = available_df.sort_values(['fiscal_year', 'fiscal_quarter'], ascending=False).iloc[0]
         year = int(latest['fiscal_year'])
         quarter = int(latest['fiscal_quarter'])
         
-        # 3. Fetch specific transcript content
+        # Fetch specific transcript content
         raw_data = transcripts.get_transcript(year, quarter)
         
         if raw_data is None or raw_data.empty:
              return jsonify({"error": "Transcript content empty"}), 404
 
-        # 4. Format into a readable string for the AI
+        # Format into a readable string for the AI
         full_text = f"EARNINGS TRANSCRIPT: {symbol} | FY{year} Q{quarter}\n====================================\n"
         for _, row in raw_data.iterrows():
             speaker = row['speaker'].upper() if row['speaker'] else "UNKNOWN"
@@ -61,12 +83,12 @@ def get_transcript(symbol):
             "symbol": symbol,
             "year": year,
             "quarter": quarter,
-            "transcript": full_text
+            "transcript": full_text,
+            "source": "DefeatBeta"
         })
 
     except Exception as e:
         print(f"Transcript Error: {e}")
-        # Return 500 but with JSON error so frontend handles it gracefully
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/stock/<ticker>')
