@@ -28,16 +28,10 @@ def get_headers():
     }
 
 def get_soup(url, log_func=print):
-    """
-    Fetches a URL and returns a BeautifulSoup object.
-    Includes error handling and logging.
-    """
     try:
-        time.sleep(1) # Politeness delay
+        time.sleep(1) 
         response = requests.get(url, headers=get_headers(), timeout=15)
-        response.raise_for_status() # Raise error for 403/404/500
-        
-        # USE .content instead of .text for correct Japanese encoding detection
+        response.raise_for_status()
         return BeautifulSoup(response.content, 'html.parser')
     except Exception as e:
         log_func(f" [!] Error fetching {url}: {e}") 
@@ -45,7 +39,7 @@ def get_soup(url, log_func=print):
 
 def parse_date_from_text(text):
     if not text: return None
-    # Try YYYY.MM.DD, YYYY/MM/DD, YYYY年MM月DD日
+    # Matches 2025.11.12, 2025/11/12, 2025年11月12日, 2025-11-12
     match = re.search(r'(20\d{2})[./年\-](\d{1,2})[./月\-](\d{1,2})', text)
     if match:
         try:
@@ -54,7 +48,7 @@ def parse_date_from_text(text):
             pass
     return None
 
-def extract_text_from_pdf_bytes(pdf_bytes):
+def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
     text = ""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -63,7 +57,7 @@ def extract_text_from_pdf_bytes(pdf_bytes):
                 if extracted:
                     text += extracted + "\n"
     except Exception as e:
-        print(f"PDF Extraction Error: {e}")
+        log_func(f"PDF Extraction Error: {e}")
     return text
 
 def stitch_html_transcript(item, log_func=print):
@@ -78,47 +72,106 @@ def stitch_html_transcript(item, log_func=print):
         soup = get_soup(target, log_func)
         if not soup: break
         
-        # Expanded selectors for resilience
         main = soup.find('div', class_=re.compile(r'article-body|log-container|article-content|post-content|body-text')) or soup.find('article')
         
-        # Fallback: Find the div with the most paragraph tags if no class matches
         if not main:
             divs = soup.find_all('div')
             if divs:
                 main = max(divs, key=lambda d: len(d.find_all('p')))
 
         if main:
-            # Get text from common block elements
             ps = main.find_all(['p', 'div', 'h2', 'li'])
             valid = []
             for el in ps:
                 txt = el.get_text().strip()
-                # Filter out navigation, page numbers, and social buttons
                 if len(txt) > 1 and not re.match(r'^\d+\s?/\s?\d+', txt):
                     if not any(c in el.get('class',[]) for c in ['paging','sns-share','breadcrumb']):
                         valid.append(txt)
             
-            # Deduplicate sequential lines
             deduped = []
             for i, x in enumerate(valid):
                 if i==0 or x != valid[i-1]: deduped.append(x)
             
             text_chunk = "\n\n".join(deduped)
-            
-            # Stop if page exists but has no content (often happens on paginated sites going out of bounds)
             if not text_chunk: break
-            
             full_text.append(text_chunk)
         else:
             break
             
-        # Check for "Next" button to decide if we continue
         next_btn = soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ|Next')) or soup.find('li', class_='next')
         if not next_btn: 
             break
         page += 1
         
     return "\n\n".join(full_text)
+
+def analyze_company_page(soup, logs):
+    items = []
+    seen_urls = set()
+    
+    all_links = soup.find_all('a', href=True)
+
+    for link in all_links:
+        href = link['href']
+        text = link.get_text(strip=True)
+        full_url = urljoin("https://finance.logmi.jp", href)
+        
+        if full_url in seen_urls: continue
+        
+        # --- Type Detection ---
+        item_type = "OTHER"
+        priority = TYPE_PRIORITY["OTHER"]
+        is_html = "/articles/" in href
+        is_pdf = "active_storage" in href or href.lower().endswith(".pdf")
+        
+        if is_html:
+            item_type = "HTML_TRANSCRIPT"
+            priority = TYPE_PRIORITY["HTML_TRANSCRIPT"]
+        elif is_pdf:
+            if "書き起こし" in text:
+                item_type = "PDF_TRANSCRIPT"
+                priority = TYPE_PRIORITY["PDF_TRANSCRIPT"]
+            elif "説明会資料" in text or "説明資料" in text:
+                item_type = "PDF_PRESENTATION"
+                priority = TYPE_PRIORITY["PDF_PRESENTATION"]
+            elif "短信" in text or "決算" in text:
+                item_type = "PDF_TANSHIN"
+                priority = TYPE_PRIORITY["PDF_TANSHIN"]
+            else: continue
+        else: continue
+
+        # --- Robust Date Extraction (Tree Climber) ---
+        date_obj = None
+        # 1. Check link text
+        date_obj = parse_date_from_text(text)
+        # 2. Check previous sibling
+        if not date_obj:
+            prev = link.find_previous_sibling()
+            if prev: date_obj = parse_date_from_text(prev.get_text())
+        # 3. Check parents (up to 3 levels up - crucial for tables)
+        if not date_obj:
+            curr = link
+            for _ in range(3):
+                parent = curr.parent
+                if parent:
+                    # Get text of parent, but be careful not to grab the whole page
+                    block_text = parent.get_text(" ", strip=True)
+                    date_obj = parse_date_from_text(block_text)
+                    if date_obj: break
+                    curr = parent
+                else: break
+        
+        if date_obj:
+            seen_urls.add(full_url)
+            items.append({
+                'type': item_type,
+                'date': date_obj,
+                'url': full_url,
+                'priority': priority,
+                'title': text[:50]
+            })
+
+    return items
 
 def scrape_japanese_transcript(ticker):
     logs = []
@@ -127,46 +180,42 @@ def scrape_japanese_transcript(ticker):
         logs.append(str(msg))
 
     log(f"Starting scrape for {ticker}")
-    
     clean_ticker = ticker.replace('.T', '').strip()
     
-    # Use Logmi specific query
-    query = f"{clean_ticker} ログミー finance"
+    # FIX: Use simple query (removed 'finance' which might skew results)
+    query = f"{clean_ticker} ログミー"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     
     log(f"Searching: {search_url}")
     
     try:
-        # 1. Search Yahoo JP for the Logmi company page
+        # 1. Search Yahoo JP
         soup = get_soup(search_url, log)
+        if not soup: return None, logs
+        
         company_url = None
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if 'finance.logmi.jp/companies/' in href:
+                company_url = href
+                if 'RU=' in company_url: # Clean Yahoo redirect
+                    try:
+                        import urllib.parse
+                        qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
+                        if 'RU' in qs: company_url = qs['RU'][0]
+                    except: pass
+                break
         
-        if soup:
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                # Look for finance.logmi.jp/companies/1234 or articles directly
-                if 'finance.logmi.jp/companies/' in href:
-                    company_url = href
-                    # Clean yahoo redirect wrapper if present
-                    if 'RU=' in company_url:
-                        try:
-                            import urllib.parse
-                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
-                            if 'RU' in qs: company_url = qs['RU'][0]
-                        except: pass
-                    break
-        
-        # 1b. Fallback: If no company page, look for direct article link
-        if not company_url and soup:
+        # 1b. Fallback: Direct article
+        if not company_url:
              for link in soup.find_all('a', href=True):
                 href = link['href']
                 if 'finance.logmi.jp/articles/' in href:
-                    # We found a direct article, use it directly if it looks recent
                     log(f"Found Direct Article URL: {href}")
                     return stitch_html_transcript({'url': href}, log), logs
 
         if not company_url:
-            log("Company URL not found in search results.")
+            log("Company URL not found.")
             return None, logs
 
         log(f"Found Company URL: {company_url}")
@@ -175,83 +224,44 @@ def scrape_japanese_transcript(ticker):
         soup = get_soup(company_url, log)
         if not soup: return None, logs
         
-        items = []
-        seen_urls = set()
+        # 3. Analyze Items
+        items = analyze_company_page(soup, logs)
         
-        # 3. Find Transcripts on Company Page
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            text = link.get_text(strip=True)
-            full_url = urljoin("https://finance.logmi.jp", href)
-            
-            if full_url in seen_urls: continue
-            
-            item_type = "OTHER"
-            priority = TYPE_PRIORITY["OTHER"]
-            is_html = "/articles/" in href
-            is_pdf = "active_storage" in href or href.lower().endswith(".pdf")
-            
-            if is_html:
-                item_type = "HTML_TRANSCRIPT"
-                priority = TYPE_PRIORITY["HTML_TRANSCRIPT"]
-            elif is_pdf:
-                if "書き起こし" in text:
-                    item_type = "PDF_TRANSCRIPT"
-                    priority = TYPE_PRIORITY["PDF_TRANSCRIPT"]
-                elif "説明会資料" in text or "説明資料" in text:
-                    item_type = "PDF_PRESENTATION"
-                    priority = TYPE_PRIORITY["PDF_PRESENTATION"]
-                elif "短信" in text or "決算" in text:
-                    item_type = "PDF_TANSHIN"
-                    priority = TYPE_PRIORITY["PDF_TANSHIN"]
-                else: continue
-            else: continue
-
-            # Date Parsing
-            date_obj = parse_date_from_text(text)
-            if not date_obj:
-                # Look at parent or sibling elements for date
-                parent = link.parent
-                if parent: date_obj = parse_date_from_text(parent.get_text())
-                if not date_obj:
-                    prev = link.find_previous_sibling()
-                    if prev: date_obj = parse_date_from_text(prev.get_text())
-            
-            # Fallback: If finding date fails, use current date minus index (assuming chronological order) to sort
-            if not date_obj:
-                 date_obj = datetime.now() 
-
-            if date_obj:
-                seen_urls.add(full_url)
-                items.append({
-                    'type': item_type,
-                    'date': date_obj,
-                    'url': full_url,
-                    'priority': priority
-                })
-
-        if not items: 
+        if not items:
             log("No items found on company page.")
             return None, logs
+
+        # 4. SMART SELECTION LOGIC (The Fix)
+        # Find absolute latest date
+        items.sort(key=lambda x: x['date'], reverse=True)
+        latest_date = items[0]['date']
+        log(f"Latest content date: {latest_date.strftime('%Y-%m-%d')}")
+
+        # Define 10-day window
+        window_start = latest_date - timedelta(days=10)
         
-        # 4. Sort and Select Best Item
-        # Priority: HTML Transcript > PDF Transcript > Presentation > Others
-        # Secondary Sort: Date (Newest first)
-        items.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
+        # Filter items in window
+        candidates = [i for i in items if i['date'] >= window_start]
         
-        best = items[0]
-        log(f"Selected: {best['type']} ({best['date']}) - {best['url']}")
+        # Sort candidates by Priority (HTML > PDF)
+        candidates.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
+        
+        best = candidates[0]
+        log(f"🏆 Selected Winner: {best['type']} ({best['date'].strftime('%Y-%m-%d')})")
+        log(f"URL: {best['url']}")
         
         # 5. Extract Text
         try:
             if best['type'] == 'HTML_TRANSCRIPT':
-                transcript_text = stitch_html_transcript(best, log)
-                return transcript_text, logs
+                return stitch_html_transcript(best, log), logs
             else:
+                log("Downloading PDF for extraction...")
                 resp = requests.get(best['url'], headers=get_headers())
                 if resp.status_code == 200:
-                    text = extract_text_from_pdf_bytes(resp.content)
+                    text = extract_text_from_pdf_bytes(resp.content, log)
                     return text, logs
+                else:
+                    log(f"PDF Download failed: {resp.status_code}")
         except Exception as e:
             log(f"Extraction failed: {e}")
             return None, logs
