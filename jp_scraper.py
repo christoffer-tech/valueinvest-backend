@@ -29,7 +29,7 @@ def get_headers():
 
 def get_soup(url):
     try:
-        time.sleep(1)
+        time.sleep(1) # Politeness delay
         response = requests.get(url, headers=get_headers(), timeout=10)
         if response.status_code != 200: return None
         return BeautifulSoup(response.text, 'html.parser')
@@ -38,6 +38,7 @@ def get_soup(url):
 
 def parse_date_from_text(text):
     if not text: return None
+    # Matches 2025.11.12, 2025/11/12, 2025年11月12日
     match = re.search(r'(20\d{2})[./年\-](\d{1,2})[./月\-](\d{1,2})', text)
     if match:
         try:
@@ -55,19 +56,21 @@ def extract_text_from_pdf_bytes(pdf_bytes):
                 if extracted:
                     text += extracted + "\n"
     except Exception as e:
-        print(f"PDF Error: {e}")
+        print(f"PDF Extraction Error: {e}")
     return text
 
 def stitch_html_transcript(item):
     full_text = []
     page = 1
     url = item['url']
-    while True:
+    
+    # Limit pages to prevent infinite loops
+    while page < 15:
         target = f"{url}?page={page}" if page > 1 else url
         soup = get_soup(target)
         if not soup: break
         
-        # Adjust selector based on actual Logmi structure
+        # Logmi Article Body Selector
         main = soup.find('div', class_=re.compile(r'article-body|log-container')) or soup.find('article')
         
         if main:
@@ -75,10 +78,12 @@ def stitch_html_transcript(item):
             valid = []
             for el in ps:
                 txt = el.get_text().strip()
+                # Filter out pagination numbers like "1/5" or empty strings
                 if len(txt) > 1 and not re.match(r'^\d+\s?/\s?\d+', txt):
                     if not any(c in el.get('class',[]) for c in ['paging','sns-share']):
                         valid.append(txt)
             
+            # Simple deduping of adjacent identical lines
             deduped = []
             for i, x in enumerate(valid):
                 if i==0 or x != valid[i-1]: deduped.append(x)
@@ -89,17 +94,18 @@ def stitch_html_transcript(item):
         else:
             break
             
-        if not (soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ'))): break
+        # Check for "Next" button to continue
+        if not (soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ'))): 
+            break
         page += 1
-        if page > 15: break # Safety break
         
     return "\n\n".join(full_text)
 
 def scrape_japanese_transcript(ticker):
-    # 1. Clean Ticker (remove .T if present for search)
+    # 1. Clean Ticker (remove .T)
     clean_ticker = ticker.replace('.T', '').strip()
     
-    # 2. Find Company Page
+    # 2. Find Company Page via Yahoo JP Search
     query = f"{clean_ticker} ログミー"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     soup = get_soup(search_url)
@@ -108,6 +114,7 @@ def scrape_japanese_transcript(ticker):
     if soup:
         for link in soup.find_all('a', href=True):
             href = link['href']
+            # Look for finance.logmi.jp link
             match = re.search(r'finance\.logmi\.jp/companies/(\d+)', href)
             if match:
                 company_url = f"https://finance.logmi.jp/companies/{match.group(1)}"
@@ -116,7 +123,7 @@ def scrape_japanese_transcript(ticker):
     if not company_url:
         return None
 
-    # 3. Analyze Page
+    # 3. Analyze Company Page for Transcripts
     soup = get_soup(company_url)
     if not soup: return None
     
@@ -151,9 +158,9 @@ def scrape_japanese_transcript(ticker):
             else: continue
         else: continue
 
-        # Date Extraction logic (simplified for brevity, use your robust one)
         date_obj = parse_date_from_text(text)
         if not date_obj:
+            # Try finding date in previous element
             prev = link.find_previous_sibling()
             if prev: date_obj = parse_date_from_text(prev.get_text())
             
@@ -166,15 +173,21 @@ def scrape_japanese_transcript(ticker):
                 'priority': priority
             })
 
-    # 4. Selection Logic
+    # 4. Selection Logic (Recent Window + Priority)
     if not items: return None
+    
+    # Sort by newest first
     items.sort(key=lambda x: x['date'], reverse=True)
     latest_date = items[0]['date']
+    
+    # Only look at items within 10 days of the latest release
     window_start = latest_date - timedelta(days=10)
-    
     candidates = [i for i in items if i['date'] >= window_start]
-    if not candidates: candidates = [items[0]] # Fallback to latest
     
+    # Fallback if filtering removed everything (rare)
+    if not candidates: candidates = [items[0]] 
+    
+    # Rank: Priority first (HTML=1), then Date (Newest)
     ranked = sorted(candidates, key=lambda x: (x['priority'], -x['date'].timestamp()))
     best = ranked[0]
     
@@ -183,7 +196,7 @@ def scrape_japanese_transcript(ticker):
         if best['type'] == 'HTML_TRANSCRIPT':
             return stitch_html_transcript(best)
         else:
-            # PDF Download & Extract
+            # Download PDF to memory
             resp = requests.get(best['url'], headers=get_headers())
             if resp.status_code == 200:
                 return extract_text_from_pdf_bytes(resp.content)
