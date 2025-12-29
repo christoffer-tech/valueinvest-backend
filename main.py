@@ -10,14 +10,6 @@ from jp_scraper import scrape_japanese_transcript
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURATION ---
-# Create a custom session to avoid Yahoo 429/Rate Limit errors
-# Yahoo blocks requests without a browser-like User-Agent
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-})
-
 def sanitize(data):
     """
     Recursively convert Pandas Timestamps and other non-JSON types.
@@ -106,12 +98,11 @@ def get_stock(ticker):
     try:
         print(f"Fetching data for {ticker}...")
         
-        # FIX 1: Pass the session with User-Agent to yfinance
-        stock = yf.Ticker(ticker, session=session)
+        # REMOVED custom session to fix "Yahoo API requires curl_cffi" error
+        stock = yf.Ticker(ticker)
         period = request.args.get('range', '2y')
         
         # Force a history fetch first to check if the ticker is valid/accessible
-        # 'timeSeries' module often fails on cold starts, so we rely on info + history
         hist = stock.history(period=period)
         
         if hist.empty:
