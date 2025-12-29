@@ -45,6 +45,7 @@ def get_soup(url, log_func=print):
 
 def parse_date_from_text(text):
     if not text: return None
+    # Try YYYY.MM.DD, YYYY/MM/DD, YYYY年MM月DD日
     match = re.search(r'(20\d{2})[./年\-](\d{1,2})[./月\-](\d{1,2})', text)
     if match:
         try:
@@ -77,30 +78,43 @@ def stitch_html_transcript(item, log_func=print):
         soup = get_soup(target, log_func)
         if not soup: break
         
-        # Look for the main article body
-        main = soup.find('div', class_=re.compile(r'article-body|log-container')) or soup.find('article')
+        # Expanded selectors for resilience
+        main = soup.find('div', class_=re.compile(r'article-body|log-container|article-content|post-content|body-text')) or soup.find('article')
         
+        # Fallback: Find the div with the most paragraph tags if no class matches
+        if not main:
+            divs = soup.find_all('div')
+            if divs:
+                main = max(divs, key=lambda d: len(d.find_all('p')))
+
         if main:
-            ps = main.find_all(['p', 'div', 'h2'])
+            # Get text from common block elements
+            ps = main.find_all(['p', 'div', 'h2', 'li'])
             valid = []
             for el in ps:
                 txt = el.get_text().strip()
-                # Filter out navigation elements and page numbers
+                # Filter out navigation, page numbers, and social buttons
                 if len(txt) > 1 and not re.match(r'^\d+\s?/\s?\d+', txt):
-                    if not any(c in el.get('class',[]) for c in ['paging','sns-share']):
+                    if not any(c in el.get('class',[]) for c in ['paging','sns-share','breadcrumb']):
                         valid.append(txt)
             
+            # Deduplicate sequential lines
             deduped = []
             for i, x in enumerate(valid):
                 if i==0 or x != valid[i-1]: deduped.append(x)
             
             text_chunk = "\n\n".join(deduped)
+            
+            # Stop if page exists but has no content (often happens on paginated sites going out of bounds)
             if not text_chunk: break
+            
             full_text.append(text_chunk)
         else:
             break
             
-        if not (soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ'))): 
+        # Check for "Next" button to decide if we continue
+        next_btn = soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ|Next')) or soup.find('li', class_='next')
+        if not next_btn: 
             break
         page += 1
         
@@ -116,7 +130,8 @@ def scrape_japanese_transcript(ticker):
     
     clean_ticker = ticker.replace('.T', '').strip()
     
-    query = f"{clean_ticker} ログミー"
+    # Use Logmi specific query
+    query = f"{clean_ticker} ログミー finance"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     
     log(f"Searching: {search_url}")
@@ -129,16 +144,32 @@ def scrape_japanese_transcript(ticker):
         if soup:
             for link in soup.find_all('a', href=True):
                 href = link['href']
-                # Look for finance.logmi.jp/companies/1234
-                match = re.search(r'finance\.logmi\.jp/companies/(\d+)', href)
-                if match:
-                    company_url = f"https://finance.logmi.jp/companies/{match.group(1)}"
-                    log(f"Found Company URL: {company_url}")
+                # Look for finance.logmi.jp/companies/1234 or articles directly
+                if 'finance.logmi.jp/companies/' in href:
+                    company_url = href
+                    # Clean yahoo redirect wrapper if present
+                    if 'RU=' in company_url:
+                        try:
+                            import urllib.parse
+                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
+                            if 'RU' in qs: company_url = qs['RU'][0]
+                        except: pass
                     break
         
+        # 1b. Fallback: If no company page, look for direct article link
+        if not company_url and soup:
+             for link in soup.find_all('a', href=True):
+                href = link['href']
+                if 'finance.logmi.jp/articles/' in href:
+                    # We found a direct article, use it directly if it looks recent
+                    log(f"Found Direct Article URL: {href}")
+                    return stitch_html_transcript({'url': href}, log), logs
+
         if not company_url:
             log("Company URL not found in search results.")
             return None, logs
+
+        log(f"Found Company URL: {company_url}")
 
         # 2. Visit Company Page
         soup = get_soup(company_url, log)
@@ -147,7 +178,7 @@ def scrape_japanese_transcript(ticker):
         items = []
         seen_urls = set()
         
-        # 3. Find Transcripts
+        # 3. Find Transcripts on Company Page
         for link in soup.find_all('a', href=True):
             href = link['href']
             text = link.get_text(strip=True)
@@ -176,14 +207,19 @@ def scrape_japanese_transcript(ticker):
                 else: continue
             else: continue
 
+            # Date Parsing
             date_obj = parse_date_from_text(text)
             if not date_obj:
-                prev = link.find_previous_sibling()
-                if prev: date_obj = parse_date_from_text(prev.get_text())
+                # Look at parent or sibling elements for date
+                parent = link.parent
+                if parent: date_obj = parse_date_from_text(parent.get_text())
+                if not date_obj:
+                    prev = link.find_previous_sibling()
+                    if prev: date_obj = parse_date_from_text(prev.get_text())
             
-            # If still no date, assume it's recent if it's high up on the page
-            if not date_obj and len(items) < 3:
-                 date_obj = datetime.now() # Fallback for sorting
+            # Fallback: If finding date fails, use current date minus index (assuming chronological order) to sort
+            if not date_obj:
+                 date_obj = datetime.now() 
 
             if date_obj:
                 seen_urls.add(full_url)
@@ -199,19 +235,11 @@ def scrape_japanese_transcript(ticker):
             return None, logs
         
         # 4. Sort and Select Best Item
-        items.sort(key=lambda x: x['date'], reverse=True)
-        latest_date = items[0]['date']
-        log(f"Latest Date: {latest_date}")
+        # Priority: HTML Transcript > PDF Transcript > Presentation > Others
+        # Secondary Sort: Date (Newest first)
+        items.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
         
-        # Filter for last 90 days to be safe
-        window_start = latest_date - timedelta(days=90)
-        candidates = [i for i in items if i['date'] >= window_start]
-        
-        if not candidates: candidates = [items[0]] 
-        
-        # Rank by Priority (HTML > PDF)
-        ranked = sorted(candidates, key=lambda x: (x['priority'], -x['date'].timestamp()))
-        best = ranked[0]
+        best = items[0]
         log(f"Selected: {best['type']} ({best['date']}) - {best['url']}")
         
         # 5. Extract Text
