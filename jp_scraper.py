@@ -30,15 +30,18 @@ def get_headers():
 def get_soup(url):
     try:
         time.sleep(1) # Politeness delay
-        response = requests.get(url, headers=get_headers(), timeout=10)
-        if response.status_code != 200: return None
-        return BeautifulSoup(response.text, 'html.parser')
-    except:
+        # Increased timeout to 15s to match Colab
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        response.raise_for_status() # Raise error for 403/404/500
+        
+        # USE .content instead of .text for correct Japanese encoding detection
+        return BeautifulSoup(response.content, 'html.parser')
+    except Exception as e:
+        print(f" [!] Error fetching {url}: {e}") # Log the error so you can see it in Render logs
         return None
 
 def parse_date_from_text(text):
     if not text: return None
-    # Matches 2025.11.12, 2025/11/12, 2025年11月12日
     match = re.search(r'(20\d{2})[./年\-](\d{1,2})[./月\-](\d{1,2})', text)
     if match:
         try:
@@ -64,13 +67,13 @@ def stitch_html_transcript(item):
     page = 1
     url = item['url']
     
-    # Limit pages to prevent infinite loops
+    print(f"Stitching HTML: {url}")
+    
     while page < 15:
         target = f"{url}?page={page}" if page > 1 else url
         soup = get_soup(target)
         if not soup: break
         
-        # Logmi Article Body Selector
         main = soup.find('div', class_=re.compile(r'article-body|log-container')) or soup.find('article')
         
         if main:
@@ -78,12 +81,10 @@ def stitch_html_transcript(item):
             valid = []
             for el in ps:
                 txt = el.get_text().strip()
-                # Filter out pagination numbers like "1/5" or empty strings
                 if len(txt) > 1 and not re.match(r'^\d+\s?/\s?\d+', txt):
                     if not any(c in el.get('class',[]) for c in ['paging','sns-share']):
                         valid.append(txt)
             
-            # Simple deduping of adjacent identical lines
             deduped = []
             for i, x in enumerate(valid):
                 if i==0 or x != valid[i-1]: deduped.append(x)
@@ -94,7 +95,6 @@ def stitch_html_transcript(item):
         else:
             break
             
-        # Check for "Next" button to continue
         if not (soup.find('a', rel='next') or soup.find('a', string=re.compile(r'次へ'))): 
             break
         page += 1
@@ -102,10 +102,10 @@ def stitch_html_transcript(item):
     return "\n\n".join(full_text)
 
 def scrape_japanese_transcript(ticker):
-    # 1. Clean Ticker (remove .T)
+    print(f"Scraping JP Transcript for: {ticker}")
+    
     clean_ticker = ticker.replace('.T', '').strip()
     
-    # 2. Find Company Page via Yahoo JP Search
     query = f"{clean_ticker} ログミー"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     soup = get_soup(search_url)
@@ -114,16 +114,16 @@ def scrape_japanese_transcript(ticker):
     if soup:
         for link in soup.find_all('a', href=True):
             href = link['href']
-            # Look for finance.logmi.jp link
             match = re.search(r'finance\.logmi\.jp/companies/(\d+)', href)
             if match:
                 company_url = f"https://finance.logmi.jp/companies/{match.group(1)}"
+                print(f"Found Company URL: {company_url}")
                 break
     
     if not company_url:
+        print("Company URL not found in search results.")
         return None
 
-    # 3. Analyze Company Page for Transcripts
     soup = get_soup(company_url)
     if not soup: return None
     
@@ -160,7 +160,6 @@ def scrape_japanese_transcript(ticker):
 
         date_obj = parse_date_from_text(text)
         if not date_obj:
-            # Try finding date in previous element
             prev = link.find_previous_sibling()
             if prev: date_obj = parse_date_from_text(prev.get_text())
             
@@ -173,30 +172,28 @@ def scrape_japanese_transcript(ticker):
                 'priority': priority
             })
 
-    # 4. Selection Logic (Recent Window + Priority)
-    if not items: return None
+    if not items: 
+        print("No items found on company page.")
+        return None
     
-    # Sort by newest first
     items.sort(key=lambda x: x['date'], reverse=True)
     latest_date = items[0]['date']
+    print(f"Latest Date: {latest_date}")
     
-    # Only look at items within 10 days of the latest release
-    window_start = latest_date - timedelta(days=10)
+    # RESTORED 30 DAY WINDOW (Matches Colab)
+    window_start = latest_date - timedelta(days=30)
     candidates = [i for i in items if i['date'] >= window_start]
     
-    # Fallback if filtering removed everything (rare)
     if not candidates: candidates = [items[0]] 
     
-    # Rank: Priority first (HTML=1), then Date (Newest)
     ranked = sorted(candidates, key=lambda x: (x['priority'], -x['date'].timestamp()))
     best = ranked[0]
+    print(f"Selected: {best['type']} ({best['date']})")
     
-    # 5. Extract Text
     try:
         if best['type'] == 'HTML_TRANSCRIPT':
             return stitch_html_transcript(best)
         else:
-            # Download PDF to memory
             resp = requests.get(best['url'], headers=get_headers())
             if resp.status_code == 200:
                 return extract_text_from_pdf_bytes(resp.content)
