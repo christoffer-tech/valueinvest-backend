@@ -33,22 +33,31 @@ def get_transcript(symbol):
     # --- 1. JAPANESE STOCK HANDLER ---
     # Detect if ticker ends in .T or is a 4-digit code (common JP format)
     if symbol.endswith('.T') or (symbol.isdigit() and len(symbol) == 4):
+        logs = []
         try:
             print(f"Fetching Japanese transcript for {symbol} via Logmi...")
-            # If user passed just "4414", scrape_japanese_transcript handles adding suffixes if needed
-            transcript_text = scrape_japanese_transcript(symbol)
+            
+            # UPDATED: Expect a tuple (text, logs) from the scraper
+            transcript_text, logs = scrape_japanese_transcript(symbol)
             
             if transcript_text:
                 return jsonify({
                     "symbol": symbol,
                     "transcript": transcript_text,
-                    "source": "Logmi (Japan)"
+                    "source": "Logmi (Japan)",
+                    "debug_logs": logs  # <--- Send logs to frontend
                 })
             else:
-                return jsonify({"error": "No relevant Japanese transcript/material found"}), 404
+                return jsonify({
+                    "error": "No relevant Japanese transcript/material found",
+                    "debug_logs": logs  # <--- Send logs so we know WHY it failed
+                }), 404
         except Exception as e:
             print(f"JP Transcript Error: {e}")
-            return jsonify({"error": str(e)}), 500
+            return jsonify({
+                "error": str(e),
+                "debug_logs": logs if logs else [str(e)]
+            }), 500
 
     # --- 2. US STOCK HANDLER (Existing DefeatBeta Logic) ---
     try:
