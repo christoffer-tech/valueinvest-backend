@@ -4,3 +4,7 @@ yfinance
 gunicorn
 defeatbeta-api
 pandas
+requests
+beautifulsoup4
+pdfplumber
+lxml
