@@ -39,7 +39,6 @@ def get_soup(url, log_func=print):
 
 def parse_date_from_text(text):
     if not text: return None
-    # Matches 2025.11.12, 2025/11/12, 2025年11月12日, 2025-11-12
     match = re.search(r'(20\d{2})[./年\-](\d{1,2})[./月\-](\d{1,2})', text)
     if match:
         try:
@@ -142,19 +141,15 @@ def analyze_company_page(soup, logs):
 
         # --- Robust Date Extraction (Tree Climber) ---
         date_obj = None
-        # 1. Check link text
         date_obj = parse_date_from_text(text)
-        # 2. Check previous sibling
         if not date_obj:
             prev = link.find_previous_sibling()
             if prev: date_obj = parse_date_from_text(prev.get_text())
-        # 3. Check parents (up to 3 levels up - crucial for tables)
         if not date_obj:
             curr = link
             for _ in range(3):
                 parent = curr.parent
                 if parent:
-                    # Get text of parent, but be careful not to grab the whole page
                     block_text = parent.get_text(" ", strip=True)
                     date_obj = parse_date_from_text(block_text)
                     if date_obj: break
@@ -182,7 +177,6 @@ def scrape_japanese_transcript(ticker):
     log(f"Starting scrape for {ticker}")
     clean_ticker = ticker.replace('.T', '').strip()
     
-    # FIX: Use simple query (removed 'finance' which might skew results)
     query = f"{clean_ticker} ログミー"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     
@@ -198,7 +192,7 @@ def scrape_japanese_transcript(ticker):
             href = link['href']
             if 'finance.logmi.jp/companies/' in href:
                 company_url = href
-                if 'RU=' in company_url: # Clean Yahoo redirect
+                if 'RU=' in company_url:
                     try:
                         import urllib.parse
                         qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
@@ -206,7 +200,6 @@ def scrape_japanese_transcript(ticker):
                     except: pass
                 break
         
-        # 1b. Fallback: Direct article
         if not company_url:
              for link in soup.find_all('a', href=True):
                 href = link['href']
@@ -226,45 +219,73 @@ def scrape_japanese_transcript(ticker):
         
         # 3. Analyze Items
         items = analyze_company_page(soup, logs)
-        
         if not items:
             log("No items found on company page.")
             return None, logs
 
-        # 4. SMART SELECTION LOGIC (The Fix)
-        # Find absolute latest date
+        # --- 4. STRATEGY SELECTION (UPDATED) ---
+        
+        # A. Find the Best "Recent" File (The Latest Update)
         items.sort(key=lambda x: x['date'], reverse=True)
         latest_date = items[0]['date']
-        log(f"Latest content date: {latest_date.strftime('%Y-%m-%d')}")
-
-        # Define 10-day window
+        
+        # Window logic: Best item within 10 days of the absolute latest date
         window_start = latest_date - timedelta(days=10)
+        recent_candidates = [i for i in items if i['date'] >= window_start]
+        recent_candidates.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
         
-        # Filter items in window
-        candidates = [i for i in items if i['date'] >= window_start]
+        current_winner = recent_candidates[0]
+        log(f"✅ Primary Document (Latest): {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
+
+        # B. Find the Best "Context" Transcript (Previous Quarter)
+        # Look for transcripts (Priority 1 or 2)
+        transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
+        transcripts.sort(key=lambda x: x['date'], reverse=True)
         
-        # Sort candidates by Priority (HTML > PDF)
-        candidates.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
-        
-        best = candidates[0]
-        log(f"🏆 Selected Winner: {best['type']} ({best['date'].strftime('%Y-%m-%d')})")
-        log(f"URL: {best['url']}")
-        
-        # 5. Extract Text
-        try:
-            if best['type'] == 'HTML_TRANSCRIPT':
-                return stitch_html_transcript(best, log), logs
+        secondary_doc = None
+        if transcripts:
+            latest_transcript = transcripts[0]
+            
+            # Logic: If the latest transcript is significantly older than the current winner 
+            # (e.g., > 60 days) but not ancient (< 200 days), include it.
+            days_diff = (current_winner['date'] - latest_transcript['date']).days
+            
+            if 60 < days_diff < 200:
+                secondary_doc = latest_transcript
+                log(f"✅ Secondary Document (Context): {secondary_doc['type']} ({secondary_doc['date'].strftime('%Y-%m-%d')})")
+            elif days_diff <= 60:
+                log("ℹ️ Latest transcript is recent enough (or is the primary doc). No secondary needed.")
             else:
-                log("Downloading PDF for extraction...")
-                resp = requests.get(best['url'], headers=get_headers())
-                if resp.status_code == 200:
-                    text = extract_text_from_pdf_bytes(resp.content, log)
-                    return text, logs
+                log("ℹ️ Previous transcript is too old (> 200 days). Skipping.")
+
+        # 5. Fetch Content
+        final_output = ""
+        
+        docs_to_fetch = [current_winner]
+        if secondary_doc:
+            docs_to_fetch.append(secondary_doc)
+            
+        for doc in docs_to_fetch:
+            doc_text = ""
+            header = f"\n\n{'='*40}\nDOCUMENT: {doc['type']} | DATE: {doc['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
+            
+            try:
+                if doc['type'] == 'HTML_TRANSCRIPT':
+                    doc_text = stitch_html_transcript(doc, log)
                 else:
-                    log(f"PDF Download failed: {resp.status_code}")
-        except Exception as e:
-            log(f"Extraction failed: {e}")
-            return None, logs
+                    log(f"Downloading PDF: {doc['title']}...")
+                    resp = requests.get(doc['url'], headers=get_headers())
+                    if resp.status_code == 200:
+                        doc_text = extract_text_from_pdf_bytes(resp.content, log)
+                    else:
+                        log(f"PDF Download failed: {resp.status_code}")
+                
+                if doc_text:
+                    final_output += header + doc_text
+            except Exception as e:
+                log(f"Failed to fetch {doc['type']}: {e}")
+
+        return final_output if final_output else None, logs
             
     except Exception as e:
         log(f"Global Scraper Error: {e}")
