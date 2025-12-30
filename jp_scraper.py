@@ -56,22 +56,22 @@ def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
             log_func(f"PDF has {total_pages} pages. Extracting...")
             
             for i, page in enumerate(pdf.pages):
-                # Safety Timeout: Stop if we are taking too long (e.g. > 20 seconds)
-                # This prevents Gunicorn (30s timeout) from killing the worker
+                # Safety Timeout: Stop if > 20 seconds (prevent Gunicorn kill)
                 if time.time() - start_time > 20:
                     log_func(f"⚠️ PDF extraction timed out after {i} pages. Returning partial text.")
                     text += "\n[...PDF Extraction Truncated due to Server Timeout...]\n"
                     break
 
                 try:
-                    # Basic extraction
                     extracted = page.extract_text()
                     if extracted:
                         text += extracted + "\n"
                 except Exception as page_e:
-                    # Skip problematic pages (like the 'invalid float value' error)
                     log_func(f"⚠️ Failed to extract page {i+1}: {page_e}")
-                    continue
+                
+                # --- MEMORY OPTIMIZATION FOR FREE TIER ---
+                # Clears internal cache for the page to free RAM immediately
+                page.flush_cache()
                     
     except Exception as e:
         log_func(f"PDF Global Extraction Error: {e}")
@@ -157,7 +157,7 @@ def analyze_company_page(soup, logs):
             else: continue
         else: continue
 
-        # --- Robust Date Extraction (Tree Climber) ---
+        # --- Robust Date Extraction ---
         date_obj = None
         date_obj = parse_date_from_text(text)
         if not date_obj:
@@ -241,7 +241,7 @@ def scrape_japanese_transcript(ticker):
             log("No items found on company page.")
             return None, logs
 
-        # --- 4. STRATEGY SELECTION (UPDATED) ---
+        # --- 4. STRATEGY SELECTION (DUAL-FILE) ---
         
         # A. Find the Best "Recent" File (The Latest Update)
         items.sort(key=lambda x: x['date'], reverse=True)
@@ -256,7 +256,6 @@ def scrape_japanese_transcript(ticker):
         log(f"✅ Primary Document (Latest): {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
 
         # B. Find the Best "Context" Transcript (Previous Quarter)
-        # Look for transcripts (Priority 1 or 2)
         transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
         transcripts.sort(key=lambda x: x['date'], reverse=True)
         
@@ -264,8 +263,7 @@ def scrape_japanese_transcript(ticker):
         if transcripts:
             latest_transcript = transcripts[0]
             
-            # Logic: If the latest transcript is significantly older than the current winner 
-            # (e.g., > 60 days) but not ancient (< 200 days), include it.
+            # Logic: If latest transcript is significantly older (60-200 days) than current winner, add it.
             days_diff = (current_winner['date'] - latest_transcript['date']).days
             
             if 60 < days_diff < 200:
