@@ -49,14 +49,32 @@ def parse_date_from_text(text):
 
 def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
     text = ""
+    start_time = time.time()
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text += extracted + "\n"
+            total_pages = len(pdf.pages)
+            log_func(f"PDF has {total_pages} pages. Extracting...")
+            
+            for i, page in enumerate(pdf.pages):
+                # Safety Timeout: Stop if we are taking too long (e.g. > 20 seconds)
+                # This prevents Gunicorn (30s timeout) from killing the worker
+                if time.time() - start_time > 20:
+                    log_func(f"⚠️ PDF extraction timed out after {i} pages. Returning partial text.")
+                    text += "\n[...PDF Extraction Truncated due to Server Timeout...]\n"
+                    break
+
+                try:
+                    # Basic extraction
+                    extracted = page.extract_text()
+                    if extracted:
+                        text += extracted + "\n"
+                except Exception as page_e:
+                    # Skip problematic pages (like the 'invalid float value' error)
+                    log_func(f"⚠️ Failed to extract page {i+1}: {page_e}")
+                    continue
+                    
     except Exception as e:
-        log_func(f"PDF Extraction Error: {e}")
+        log_func(f"PDF Global Extraction Error: {e}")
     return text
 
 def stitch_html_transcript(item, log_func=print):
