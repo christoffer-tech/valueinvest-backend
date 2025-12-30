@@ -7,12 +7,12 @@ import pdfplumber
 import gc
 import tempfile
 import os
-import logging  # <--- NEW: For silencing noise
+import logging
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
 
 # --- 1. SILENCE PDF NOISE ---
-# This prevents the "Invalid float value" logs from slowing down the CPU
+# Crucial: This stops the console spam that slows down the CPU
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
@@ -66,20 +66,19 @@ def format_doc_header(item):
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
-# --- MEMORY & CPU OPTIMIZED DOWNLOADER ---
+# --- MEMORY OPTIMIZED DOWNLOADER ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
     
-    # 2. STRICTER LIMITS FOR FREE TIER
-    MAX_PAGES_TO_SCAN = 10  # Only scan first 10 pages (Summary is usually here)
-    MAX_EXECUTION_TIME = 25 # Stop after 25s (Gunicorn kills at 30s)
+    # SAFETY: Stop after 25s to ensure Gunicorn doesn't kill the worker mid-process
+    MAX_EXECUTION_TIME = 25 
     
     temp_filename = None
     
     try:
         log_func(f"Streaming PDF to disk...")
-        with requests.get(url, headers=get_headers(), stream=True, timeout=15) as r:
+        with requests.get(url, headers=get_headers(), stream=True, timeout=30) as r:
             r.raise_for_status()
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
@@ -89,32 +88,25 @@ def download_and_extract_pdf(url, log_func=print):
         
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            scan_limit = min(total_pages, MAX_PAGES_TO_SCAN)
-            log_func(f"PDF has {total_pages} pages. Scanning first {scan_limit} pages...")
+            log_func(f"PDF saved. Extracting all {total_pages} pages...")
             
             for i, page in enumerate(pdf.pages):
-                # Stop if we hit page limit
-                if i >= MAX_PAGES_TO_SCAN:
-                    text += "\n[...Truncated: Reached Page Limit for Stability...]\n"
-                    break
-                
-                # Stop if we are running out of time
+                # Safety Check: Stop if we are about to be killed by the server
                 if time.time() - start_time > MAX_EXECUTION_TIME:
-                    log_func(f"⚠️ Time limit reached ({i} pages). Stopping to prevent timeout.")
-                    text += "\n[...Truncated: Execution Time Limit...]\n"
+                    log_func(f"⚠️ Execution time limit reached ({i}/{total_pages} pages). Returning partial text.")
+                    text += "\n[...Truncated: Server Execution Time Limit...]\n"
                     break
                 
                 try:
-                    # 'layout=True' is slower but better for slides. 
-                    # If this still times out, remove layout=True to speed it up.
+                    # layout=True is better for slides, but remove it if it's too slow
                     extracted = page.extract_text() 
                     if extracted:
                         text += extracted + "\n"
                 except Exception as e:
-                    # Don't print detailed error to avoid log spam
-                    log_func(f"Page {i} Skipped (Complex Graphic)")
+                    # Silent skip for complex pages
+                    pass
                 
-                # Free memory immediately
+                # CRITICAL: Free memory immediately
                 page.flush_cache()
                 
                 if i % 5 == 0:
