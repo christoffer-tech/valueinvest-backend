@@ -7,8 +7,13 @@ import pdfplumber
 import gc
 import tempfile
 import os
+import logging  # <--- NEW: For silencing noise
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
+
+# --- 1. SILENCE PDF NOISE ---
+# This prevents the "Invalid float value" logs from slowing down the CPU
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
 TYPE_PRIORITY = {
@@ -50,7 +55,6 @@ def parse_date_from_text(text):
     return None
 
 def format_doc_header(item):
-    """Generates standard headers that the AI Agent recognizes."""
     t = item['type']
     label = "DOCUMENT"
     if "TRANSCRIPT" in t:
@@ -62,18 +66,20 @@ def format_doc_header(item):
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
-# --- MEMORY OPTIMIZED DOWNLOADER (DISK STREAMING) ---
+# --- MEMORY & CPU OPTIMIZED DOWNLOADER ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
     
-    # Create a temp file path (doesn't use RAM)
+    # 2. STRICTER LIMITS FOR FREE TIER
+    MAX_PAGES_TO_SCAN = 10  # Only scan first 10 pages (Summary is usually here)
+    MAX_EXECUTION_TIME = 25 # Stop after 25s (Gunicorn kills at 30s)
+    
     temp_filename = None
     
     try:
-        # 1. STREAM DOWNLOAD TO DISK
         log_func(f"Streaming PDF to disk...")
-        with requests.get(url, headers=get_headers(), stream=True, timeout=30) as r:
+        with requests.get(url, headers=get_headers(), stream=True, timeout=15) as r:
             r.raise_for_status()
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
@@ -81,37 +87,43 @@ def download_and_extract_pdf(url, log_func=print):
                     tf.write(chunk)
                 temp_filename = tf.name
         
-        # 2. PROCESS FROM DISK
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            log_func(f"PDF saved to temp file. Extracting all {total_pages} pages...")
+            scan_limit = min(total_pages, MAX_PAGES_TO_SCAN)
+            log_func(f"PDF has {total_pages} pages. Scanning first {scan_limit} pages...")
             
             for i, page in enumerate(pdf.pages):
-                # Safety Timeout: Try to finish before Gunicorn kills the worker (usually 60s)
-                if time.time() - start_time > 50:
-                    log_func(f"⚠️ Extraction time limit reached ({i}/{total_pages} pages). Returning partial text.")
-                    text += "\n[...Truncated due to Execution Time Limit...]\n"
+                # Stop if we hit page limit
+                if i >= MAX_PAGES_TO_SCAN:
+                    text += "\n[...Truncated: Reached Page Limit for Stability...]\n"
+                    break
+                
+                # Stop if we are running out of time
+                if time.time() - start_time > MAX_EXECUTION_TIME:
+                    log_func(f"⚠️ Time limit reached ({i} pages). Stopping to prevent timeout.")
+                    text += "\n[...Truncated: Execution Time Limit...]\n"
                     break
                 
                 try:
-                    extracted = page.extract_text()
+                    # 'layout=True' is slower but better for slides. 
+                    # If this still times out, remove layout=True to speed it up.
+                    extracted = page.extract_text() 
                     if extracted:
                         text += extracted + "\n"
                 except Exception as e:
-                    log_func(f"Page {i} Error: {e}")
+                    # Don't print detailed error to avoid log spam
+                    log_func(f"Page {i} Skipped (Complex Graphic)")
                 
-                # CRITICAL: Free memory for this page immediately
+                # Free memory immediately
                 page.flush_cache()
                 
-                # Optional: GC every 10 pages to be extra safe on Free Tier
-                if i % 10 == 0:
+                if i % 5 == 0:
                     gc.collect()
 
     except Exception as e:
         log_func(f"PDF Error: {e}")
         
     finally:
-        # 3. CLEANUP
         if temp_filename and os.path.exists(temp_filename):
             try:
                 os.remove(temp_filename)
@@ -178,7 +190,6 @@ def analyze_company_page(soup, logs):
         
         if full_url in seen_urls: continue
         
-        # --- Type Detection ---
         item_type = "OTHER"
         priority = TYPE_PRIORITY["OTHER"]
         is_html = "/articles/" in href
@@ -200,7 +211,6 @@ def analyze_company_page(soup, logs):
             else: continue
         else: continue
 
-        # --- Robust Date Extraction ---
         date_obj = parse_date_from_text(text)
         if not date_obj:
             prev = link.find_previous_sibling()
@@ -243,7 +253,6 @@ def scrape_japanese_transcript(ticker):
     log(f"Searching: {search_url}")
     
     try:
-        # 1. Search Yahoo JP
         soup = get_soup(search_url, log)
         if not soup: return None, logs
         
@@ -273,49 +282,38 @@ def scrape_japanese_transcript(ticker):
 
         log(f"Found Company URL: {company_url}")
 
-        # 2. Visit Company Page
         soup = get_soup(company_url, log)
         if not soup: return None, logs
         
-        # 3. Analyze Items
         items = analyze_company_page(soup, logs)
         if not items:
             log("No items found on company page.")
             return None, logs
 
-        # --- 4. STRATEGY SELECTION ---
-        # Sort by Date (newest first), then Priority
         items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
         latest_date = items[0]['date']
         
-        # Define "Current Period" window
         window_start = latest_date - timedelta(days=10)
         recent_candidates = [i for i in items if i['date'] >= window_start]
         
-        # Sort current period by priority (Transcript=1, Slides=3)
         recent_candidates.sort(key=lambda x: x['priority'])
         
-        # PRIMARY DOC (Best available for current period)
         current_winner = recent_candidates[0]
         log(f"✅ Primary: {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
 
-        # SECONDARY DOC (Strictly Historical Context)
-        # We DO NOT look for slides from the same quarter.
         secondary_doc = None
         
         transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
         transcripts.sort(key=lambda x: x['date'], reverse=True)
         
         if transcripts:
-            # Find the first transcript that is older than the current winner
             for tx in transcripts:
                 days_diff = (current_winner['date'] - tx['date']).days
-                if 60 < days_diff < 400: # Approx 2 months to 1 year ago
+                if 60 < days_diff < 400:
                     secondary_doc = tx
                     log(f"✅ Context: {secondary_doc['type']} (Historical from {days_diff} days ago)")
                     break
 
-        # 5. Fetch Content (Disk Streaming)
         final_output = ""
         
         docs_to_fetch = [current_winner]
@@ -324,7 +322,7 @@ def scrape_japanese_transcript(ticker):
 
         for doc in docs_to_fetch:
             try:
-                gc.collect() # Aggressive GC
+                gc.collect()
                 doc_text = ""
                 header = format_doc_header(doc)
                 
