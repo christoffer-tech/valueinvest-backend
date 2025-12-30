@@ -49,39 +49,35 @@ def parse_date_from_text(text):
             pass
     return None
 
-# --- MEMORY OPTIMIZED DOWNLOADER ---
+# --- MEMORY OPTIMIZED DOWNLOADER (DISK STREAMING) ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
-    MAX_PAGES = 15  # Strict limit for Free Tier
     
+    # Create a temp file path (doesn't use RAM)
     temp_filename = None
     
     try:
-        # 1. STREAM DOWNLOAD TO DISK (Avoids RAM)
-        with requests.get(url, headers=get_headers(), stream=True, timeout=20) as r:
+        # 1. STREAM DOWNLOAD TO DISK
+        log_func(f"Streaming PDF to disk...")
+        with requests.get(url, headers=get_headers(), stream=True, timeout=30) as r:
             r.raise_for_status()
             
-            # Create a temp file on disk
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
                 for chunk in r.iter_content(chunk_size=8192): 
                     tf.write(chunk)
                 temp_filename = tf.name
         
         # 2. PROCESS FROM DISK
-        # pdfplumber reads from file path, loading only necessary parts into RAM
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            log_func(f"PDF ({total_pages} pages) saved to disk. Extracting first {min(total_pages, MAX_PAGES)}...")
+            log_func(f"PDF saved to temp file. Extracting all {total_pages} pages...")
             
             for i, page in enumerate(pdf.pages):
-                if i >= MAX_PAGES:
-                    text += "\n[...Truncated: Max Page Limit...]\n"
-                    break
-                
-                # Timeout check
-                if time.time() - start_time > 20:
-                    text += "\n[...Truncated: Timeout...]\n"
+                # Safety Timeout: Try to finish before Gunicorn kills the worker (usually 60s)
+                if time.time() - start_time > 50:
+                    log_func(f"⚠️ Extraction time limit reached ({i}/{total_pages} pages). Returning partial text.")
+                    text += "\n[...Truncated due to Execution Time Limit...]\n"
                     break
                 
                 try:
@@ -91,14 +87,18 @@ def download_and_extract_pdf(url, log_func=print):
                 except Exception as e:
                     log_func(f"Page {i} Error: {e}")
                 
-                # Free memory per page
+                # CRITICAL: Free memory for this page immediately
                 page.flush_cache()
-    
+                
+                # Optional: GC every 10 pages to be extra safe on Free Tier
+                if i % 10 == 0:
+                    gc.collect()
+
     except Exception as e:
         log_func(f"PDF Error: {e}")
         
     finally:
-        # 3. CLEANUP DISK & RAM
+        # 3. CLEANUP
         if temp_filename and os.path.exists(temp_filename):
             try:
                 os.remove(temp_filename)
@@ -293,7 +293,7 @@ def scrape_japanese_transcript(ticker):
                 secondary_doc = latest_transcript
                 log(f"✅ Context: {secondary_doc['type']} ({secondary_doc['date'].strftime('%Y-%m-%d')})")
 
-        # 5. Fetch Content (Using Disk Streamer)
+        # 5. Fetch Content (Disk Streaming)
         final_output = ""
         
         # Process Primary
@@ -315,7 +315,7 @@ def scrape_japanese_transcript(ticker):
         # Process Secondary
         if secondary_doc:
             try:
-                gc.collect() # Force cleanup before second file
+                gc.collect() 
                 
                 doc_text = ""
                 header = f"\n\n{'='*40}\nDOCUMENT: {secondary_doc['type']} | DATE: {secondary_doc['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
