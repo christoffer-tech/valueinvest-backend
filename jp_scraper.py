@@ -12,7 +12,6 @@ from urllib.parse import urljoin
 from datetime import datetime, timedelta
 
 # --- 1. SILENCE PDF NOISE ---
-# Crucial: This stops the console spam that slows down the CPU
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
@@ -71,8 +70,8 @@ def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
     
-    # SAFETY: Stop after 25s to ensure Gunicorn doesn't kill the worker mid-process
-    MAX_EXECUTION_TIME = 25 
+    # SAFETY: Must be slightly less than Gunicorn --timeout (set to 120s)
+    MAX_EXECUTION_TIME = 100 
     
     temp_filename = None
     
@@ -86,31 +85,29 @@ def download_and_extract_pdf(url, log_func=print):
                     tf.write(chunk)
                 temp_filename = tf.name
         
+        # Open with basic params
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
             log_func(f"PDF saved. Extracting all {total_pages} pages...")
             
             for i, page in enumerate(pdf.pages):
-                # Safety Check: Stop if we are about to be killed by the server
+                # Safety Valve: Return what we have instead of crashing
                 if time.time() - start_time > MAX_EXECUTION_TIME:
-                    log_func(f"⚠️ Execution time limit reached ({i}/{total_pages} pages). Returning partial text.")
-                    text += "\n[...Truncated: Server Execution Time Limit...]\n"
+                    log_func(f"⚠️ Time limit reached ({i}/{total_pages} pages). Returning partial text.")
+                    text += "\n[...Truncated: Server Time Limit Reached...]\n"
                     break
                 
                 try:
-                    # layout=True is better for slides, but remove it if it's too slow
-                    extracted = page.extract_text() 
+                    # laparams helps with Japanese vertical text detection
+                    extracted = page.extract_text(laparams={"detect_vertical": True}) 
                     if extracted:
                         text += extracted + "\n"
                 except Exception as e:
-                    # Silent skip for complex pages
-                    pass
+                    pass # Skip complex pages silently
                 
-                # CRITICAL: Free memory immediately
+                # CRITICAL: Free memory
                 page.flush_cache()
-                
-                if i % 5 == 0:
-                    gc.collect()
+                if i % 5 == 0: gc.collect()
 
     except Exception as e:
         log_func(f"PDF Error: {e}")
