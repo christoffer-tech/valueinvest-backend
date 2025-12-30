@@ -4,7 +4,9 @@ import re
 import time
 import random
 import pdfplumber
-import io
+import gc
+import tempfile
+import os
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
 
@@ -47,34 +49,62 @@ def parse_date_from_text(text):
             pass
     return None
 
-def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
+# --- MEMORY OPTIMIZED DOWNLOADER ---
+def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
+    MAX_PAGES = 15  # Strict limit for Free Tier
+    
+    temp_filename = None
+    
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # 1. STREAM DOWNLOAD TO DISK (Avoids RAM)
+        with requests.get(url, headers=get_headers(), stream=True, timeout=20) as r:
+            r.raise_for_status()
+            
+            # Create a temp file on disk
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+                for chunk in r.iter_content(chunk_size=8192): 
+                    tf.write(chunk)
+                temp_filename = tf.name
+        
+        # 2. PROCESS FROM DISK
+        # pdfplumber reads from file path, loading only necessary parts into RAM
+        with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            log_func(f"PDF has {total_pages} pages. Extracting...")
+            log_func(f"PDF ({total_pages} pages) saved to disk. Extracting first {min(total_pages, MAX_PAGES)}...")
             
             for i, page in enumerate(pdf.pages):
-                # Safety Timeout: Stop if > 20 seconds (prevent Gunicorn kill)
-                if time.time() - start_time > 20:
-                    log_func(f"⚠️ PDF extraction timed out after {i} pages. Returning partial text.")
-                    text += "\n[...PDF Extraction Truncated due to Server Timeout...]\n"
+                if i >= MAX_PAGES:
+                    text += "\n[...Truncated: Max Page Limit...]\n"
                     break
-
+                
+                # Timeout check
+                if time.time() - start_time > 20:
+                    text += "\n[...Truncated: Timeout...]\n"
+                    break
+                
                 try:
                     extracted = page.extract_text()
                     if extracted:
                         text += extracted + "\n"
-                except Exception as page_e:
-                    log_func(f"⚠️ Failed to extract page {i+1}: {page_e}")
+                except Exception as e:
+                    log_func(f"Page {i} Error: {e}")
                 
-                # --- MEMORY OPTIMIZATION FOR FREE TIER ---
-                # Clears internal cache for the page to free RAM immediately
+                # Free memory per page
                 page.flush_cache()
-                    
+    
     except Exception as e:
-        log_func(f"PDF Global Extraction Error: {e}")
+        log_func(f"PDF Error: {e}")
+        
+    finally:
+        # 3. CLEANUP DISK & RAM
+        if temp_filename and os.path.exists(temp_filename):
+            try:
+                os.remove(temp_filename)
+            except: pass
+        gc.collect()
+        
     return text
 
 def stitch_html_transcript(item, log_func=print):
@@ -158,7 +188,6 @@ def analyze_company_page(soup, logs):
         else: continue
 
         # --- Robust Date Extraction ---
-        date_obj = None
         date_obj = parse_date_from_text(text)
         if not date_obj:
             prev = link.find_previous_sibling()
@@ -241,65 +270,66 @@ def scrape_japanese_transcript(ticker):
             log("No items found on company page.")
             return None, logs
 
-        # --- 4. STRATEGY SELECTION (DUAL-FILE) ---
-        
-        # A. Find the Best "Recent" File (The Latest Update)
+        # --- 4. STRATEGY SELECTION ---
         items.sort(key=lambda x: x['date'], reverse=True)
         latest_date = items[0]['date']
         
-        # Window logic: Best item within 10 days of the absolute latest date
         window_start = latest_date - timedelta(days=10)
         recent_candidates = [i for i in items if i['date'] >= window_start]
         recent_candidates.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
         
         current_winner = recent_candidates[0]
-        log(f"✅ Primary Document (Latest): {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
+        log(f"✅ Primary: {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
 
-        # B. Find the Best "Context" Transcript (Previous Quarter)
         transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
         transcripts.sort(key=lambda x: x['date'], reverse=True)
         
         secondary_doc = None
         if transcripts:
             latest_transcript = transcripts[0]
-            
-            # Logic: If latest transcript is significantly older (60-200 days) than current winner, add it.
             days_diff = (current_winner['date'] - latest_transcript['date']).days
             
             if 60 < days_diff < 200:
                 secondary_doc = latest_transcript
-                log(f"✅ Secondary Document (Context): {secondary_doc['type']} ({secondary_doc['date'].strftime('%Y-%m-%d')})")
-            elif days_diff <= 60:
-                log("ℹ️ Latest transcript is recent enough (or is the primary doc). No secondary needed.")
-            else:
-                log("ℹ️ Previous transcript is too old (> 200 days). Skipping.")
+                log(f"✅ Context: {secondary_doc['type']} ({secondary_doc['date'].strftime('%Y-%m-%d')})")
 
-        # 5. Fetch Content
+        # 5. Fetch Content (Using Disk Streamer)
         final_output = ""
         
-        docs_to_fetch = [current_winner]
-        if secondary_doc:
-            docs_to_fetch.append(secondary_doc)
-            
-        for doc in docs_to_fetch:
+        # Process Primary
+        try:
             doc_text = ""
-            header = f"\n\n{'='*40}\nDOCUMENT: {doc['type']} | DATE: {doc['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
+            header = f"\n\n{'='*40}\nDOCUMENT: {current_winner['type']} | DATE: {current_winner['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
             
+            if current_winner['type'] == 'HTML_TRANSCRIPT':
+                doc_text = stitch_html_transcript(current_winner, log)
+            else:
+                log(f"Downloading PDF (Stream to Disk): {current_winner['title']}...")
+                doc_text = download_and_extract_pdf(current_winner['url'], log)
+
+            if doc_text:
+                final_output += header + doc_text
+        except Exception as e:
+            log(f"Failed to fetch primary: {e}")
+
+        # Process Secondary
+        if secondary_doc:
             try:
-                if doc['type'] == 'HTML_TRANSCRIPT':
-                    doc_text = stitch_html_transcript(doc, log)
-                else:
-                    log(f"Downloading PDF: {doc['title']}...")
-                    resp = requests.get(doc['url'], headers=get_headers())
-                    if resp.status_code == 200:
-                        doc_text = extract_text_from_pdf_bytes(resp.content, log)
-                    else:
-                        log(f"PDF Download failed: {resp.status_code}")
+                gc.collect() # Force cleanup before second file
                 
+                doc_text = ""
+                header = f"\n\n{'='*40}\nDOCUMENT: {secondary_doc['type']} | DATE: {secondary_doc['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
+                
+                if secondary_doc['type'] == 'HTML_TRANSCRIPT':
+                    doc_text = stitch_html_transcript(secondary_doc, log)
+                else:
+                    log(f"Downloading Context PDF (Stream to Disk)...")
+                    doc_text = download_and_extract_pdf(secondary_doc['url'], log)
+
                 if doc_text:
                     final_output += header + doc_text
             except Exception as e:
-                log(f"Failed to fetch {doc['type']}: {e}")
+                log(f"Failed to fetch secondary: {e}")
 
         return final_output if final_output else None, logs
             
