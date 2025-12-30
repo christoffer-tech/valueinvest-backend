@@ -298,7 +298,7 @@ def scrape_japanese_transcript(ticker):
         if transcripts:
             for tx in transcripts:
                 days_diff = (current_winner['date'] - tx['date']).days
-                if 60 < days_diff < 400:
+                if 60 < days_diff < 250:
                     secondary_doc = tx
                     log(f"✅ Context: {secondary_doc['type']} (Historical from {days_diff} days ago)")
                     break
