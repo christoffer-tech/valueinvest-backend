@@ -49,6 +49,19 @@ def parse_date_from_text(text):
             pass
     return None
 
+def format_doc_header(item):
+    """Generates standard headers that the AI Agent recognizes."""
+    t = item['type']
+    label = "DOCUMENT"
+    if "TRANSCRIPT" in t:
+        label = "EARNINGS CALL TRANSCRIPT"
+    elif "PRESENTATION" in t:
+        label = "PRESENTATION SLIDES"
+    elif "TANSHIN" in t:
+        label = "FINANCIAL RESULTS (TANSHIN)"
+        
+    return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
+
 # --- MEMORY OPTIMIZED DOWNLOADER (DISK STREAMING) ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
@@ -271,65 +284,60 @@ def scrape_japanese_transcript(ticker):
             return None, logs
 
         # --- 4. STRATEGY SELECTION ---
-        items.sort(key=lambda x: x['date'], reverse=True)
+        # Sort by Date (newest first), then Priority
+        items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
         latest_date = items[0]['date']
         
+        # Define "Current Period" window
         window_start = latest_date - timedelta(days=10)
         recent_candidates = [i for i in items if i['date'] >= window_start]
-        recent_candidates.sort(key=lambda x: (x['priority'], -x['date'].timestamp()))
         
+        # Sort current period by priority (Transcript=1, Slides=3)
+        recent_candidates.sort(key=lambda x: x['priority'])
+        
+        # PRIMARY DOC (Best available for current period)
         current_winner = recent_candidates[0]
         log(f"✅ Primary: {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
 
+        # SECONDARY DOC (Strictly Historical Context)
+        # We DO NOT look for slides from the same quarter.
+        secondary_doc = None
+        
         transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
         transcripts.sort(key=lambda x: x['date'], reverse=True)
         
-        secondary_doc = None
         if transcripts:
-            latest_transcript = transcripts[0]
-            days_diff = (current_winner['date'] - latest_transcript['date']).days
-            
-            if 60 < days_diff < 200:
-                secondary_doc = latest_transcript
-                log(f"✅ Context: {secondary_doc['type']} ({secondary_doc['date'].strftime('%Y-%m-%d')})")
+            # Find the first transcript that is older than the current winner
+            for tx in transcripts:
+                days_diff = (current_winner['date'] - tx['date']).days
+                if 60 < days_diff < 400: # Approx 2 months to 1 year ago
+                    secondary_doc = tx
+                    log(f"✅ Context: {secondary_doc['type']} (Historical from {days_diff} days ago)")
+                    break
 
         # 5. Fetch Content (Disk Streaming)
         final_output = ""
         
-        # Process Primary
-        try:
-            doc_text = ""
-            header = f"\n\n{'='*40}\nDOCUMENT: {current_winner['type']} | DATE: {current_winner['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
-            
-            if current_winner['type'] == 'HTML_TRANSCRIPT':
-                doc_text = stitch_html_transcript(current_winner, log)
-            else:
-                log(f"Downloading PDF (Stream to Disk): {current_winner['title']}...")
-                doc_text = download_and_extract_pdf(current_winner['url'], log)
-
-            if doc_text:
-                final_output += header + doc_text
-        except Exception as e:
-            log(f"Failed to fetch primary: {e}")
-
-        # Process Secondary
+        docs_to_fetch = [current_winner]
         if secondary_doc:
+            docs_to_fetch.append(secondary_doc)
+
+        for doc in docs_to_fetch:
             try:
-                gc.collect() 
-                
+                gc.collect() # Aggressive GC
                 doc_text = ""
-                header = f"\n\n{'='*40}\nDOCUMENT: {secondary_doc['type']} | DATE: {secondary_doc['date'].strftime('%Y-%m-%d')}\n{'='*40}\n"
+                header = format_doc_header(doc)
                 
-                if secondary_doc['type'] == 'HTML_TRANSCRIPT':
-                    doc_text = stitch_html_transcript(secondary_doc, log)
+                if doc['type'] == 'HTML_TRANSCRIPT':
+                    doc_text = stitch_html_transcript(doc, log)
                 else:
-                    log(f"Downloading Context PDF (Stream to Disk)...")
-                    doc_text = download_and_extract_pdf(secondary_doc['url'], log)
+                    log(f"Downloading PDF ({doc['type']})...")
+                    doc_text = download_and_extract_pdf(doc['url'], log)
 
                 if doc_text:
                     final_output += header + doc_text
             except Exception as e:
-                log(f"Failed to fetch secondary: {e}")
+                log(f"Failed to fetch {doc['type']}: {e}")
 
         return final_output if final_output else None, logs
             
