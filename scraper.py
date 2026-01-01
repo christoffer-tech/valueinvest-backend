@@ -15,14 +15,13 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 warnings.simplefilter("ignore")
 logging.captureWarnings(True)
 
-# Force logging to show us exactly what is happening
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 logger = logging.getLogger(__name__)
 
-# --- 2. INTELLIGENT PARSING & HELPERS ---
+# --- 2. COMPANY NAME RESOLUTION ---
 
 def clean_company_name(name):
-    """Removes legal suffixes to get a clean search term (e.g., 'Vestas Wind Systems A/S' -> 'Vestas Wind Systems')"""
+    """Removes legal suffixes."""
     if not name: return name
     suffixes = [
         r' co\.,? ?ltd\.?$', r' co,? ?ltd\.?$', r' ltd\.?$',
@@ -37,15 +36,11 @@ def clean_company_name(name):
 
 def get_company_name_lightweight(symbol):
     """
-    Fetches company name via a lightweight Yahoo Query API (bypassing the heavy yfinance library).
-    This is much faster and less prone to '429 Too Many Requests' on Render.
+    Resolves 'VWS.CO' -> 'Vestas Wind Systems' using Yahoo's public Typeahead API.
     """
     try:
-        # Direct Typeahead API (Very permissive)
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={symbol}&quotesCount=1&newsCount=0"
-        
-        # Standard user agent
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
         
@@ -60,7 +55,7 @@ def get_company_name_lightweight(symbol):
     except Exception as e:
         logger.warning(f"Name fetch failed for {symbol}: {e}")
     
-    # Fallback: Strip suffix manually (e.g., VWS.CO -> VWS)
+    # Fallback
     if "." in symbol:
         return symbol.split(".")[0]
     return symbol
@@ -68,19 +63,14 @@ def get_company_name_lightweight(symbol):
 def parse_quarter_from_string(text):
     if not text: return (0, 0)
     text = text.upper()
-    # Find Year (2020-2030)
     year_match = re.search(r'20(\d{2})', text)
-    if year_match:
-        year = int("20" + year_match.group(1))
-    else:
-        year = 0
+    year = int("20" + year_match.group(1)) if year_match else 0
         
-    # Find Quarter
     q_map = {
-        "Q1": 1, "1Q": 1, "FIRST QUARTER": 1,
-        "Q2": 2, "2Q": 2, "SECOND QUARTER": 2,
-        "Q3": 3, "3Q": 3, "THIRD QUARTER": 3,
-        "Q4": 4, "4Q": 4, "FOURTH QUARTER": 4, "FULL YEAR": 4, "FY": 4
+        "Q1": 1, "1Q": 1, "FIRST": 1,
+        "Q2": 2, "2Q": 2, "SECOND": 2, "HALF": 2,
+        "Q3": 3, "3Q": 3, "THIRD": 3,
+        "Q4": 4, "4Q": 4, "FOURTH": 4, "FULL YEAR": 4, "FY": 4
     }
     quarter = 0
     for key, val in q_map.items():
@@ -90,50 +80,43 @@ def parse_quarter_from_string(text):
             
     return (year, quarter)
 
-# --- 3. ROBUST SEARCH LOGIC ---
+# --- 3. ROBUST SEARCH LOGIC (BING PRIMARY) ---
 
-def search_ddg_html(query):
+def search_bing(query):
     """
-    Searches DuckDuckGo HTML version. 
-    This is the ONLY free method that reliably works on Render/Cloud IPs 
-    without getting blocked by CAPTCHAs immediately.
+    Scrapes Bing HTML. Much more robust for Render IPs than DDG/Google.
     """
     try:
-        session = requests.Session(impersonate="chrome120")
+        # Use a random US/EU market to broaden results
+        url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}&setmkt=en-US"
         
-        # We use the HTML endpoint which is designed for non-JS clients (easier to scrape)
-        url = "https://html.duckduckgo.com/html/"
-        payload = {'q': query}
+        # Bing requires a very standard User-Agent to not block
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://html.duckduckgo.com/",
-            "Origin": "https://html.duckduckgo.com",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5"
         }
         
-        # Must be a POST request for the HTML version
-        resp = session.post(url, data=payload, headers=headers, timeout=20)
+        session = requests.Session(impersonate="chrome120")
+        resp = session.get(url, headers=headers, timeout=20)
         
+        if resp.status_code != 200:
+            logger.warning(f"Bing returned status {resp.status_code}")
+            return []
+
         soup = BeautifulSoup(resp.content, 'html.parser')
         links = []
         
-        # DDG HTML results are in anchor tags with class 'result__a'
-        for a in soup.find_all('a', class_='result__a', href=True):
-            href = a['href']
-            # DDG wraps links; extract the real URL
-            if "uddg=" in href:
-                try:
-                    # url decode the inner url
-                    target = urllib.parse.unquote(href.split("uddg=")[1].split("&")[0])
-                    links.append(target)
-                except:
-                    pass
-            else:
-                links.append(href)
+        # Bing Results are usually in <h2><a> tags or <div class="b_algo"><h2><a>
+        for h2 in soup.find_all('h2'):
+            a = h2.find('a', href=True)
+            if a:
+                links.append(a['href'])
                 
+        logger.info(f"Bing found {len(links)} raw links for '{query}'")
         return links
     except Exception as e:
-        logger.error(f"Search Engine Error: {e}")
+        logger.error(f"Bing Search Error: {e}")
         return []
 
 def extract_valid_links(raw_links):
@@ -143,183 +126,149 @@ def extract_valid_links(raw_links):
     for link in raw_links:
         if link in seen: continue
         seen.add(link)
-        
         l = link.lower()
         
-        # Filter Junk
-        if any(x in l for x in ["google.", "yahoo.", "bing.", "duckduckgo.", "search?", "youtube."]):
+        # 1. Filter Search Engine Junk
+        if any(x in l for x in ["bing.com", "google.", "yahoo.", "microsoft.", "search?"]):
             continue
-            
-        # 1. Seeking Alpha
-        if "seekingalpha.com/article" in l and ("transcript" in l or "earnings-call" in l):
+
+        # 2. Relaxed Keyword Matching
+        # We look for "transcript" OR "earnings call" OR just "earnings" on major sites
+        is_transcript = "transcript" in l or "earnings-call" in l or "results" in l
+        
+        if "seekingalpha.com/article" in l and is_transcript:
             valid.append((link, "Seeking Alpha"))
-            
-        # 2. Investing.com
-        elif "investing.com" in l and "transcript" in l:
+        elif "investing.com" in l and is_transcript:
             valid.append((link, "Investing.com"))
-            
-        # 3. Motley Fool
-        elif "fool.com" in l and "transcript" in l:
+        elif "fool.com" in l and is_transcript:
             valid.append((link, "Motley Fool"))
-            
-        # 4. MarketScreener (Good for European stocks like VWS.CO)
-        elif "marketscreener.com" in l and "transcript" in l:
+        elif "marketscreener.com" in l and is_transcript:
             valid.append((link, "MarketScreener"))
+        elif "thestreet.com" in l and is_transcript:
+             valid.append((link, "TheStreet"))
+        elif "finance.yahoo.com" in l and is_transcript:
+             valid.append((link, "Yahoo Finance"))
 
     return valid
 
 def find_transcript_candidates(symbol):
-    # 1. Get a searchable name (Vital for non-US tickers like VWS.CO)
     name = get_company_name_lightweight(symbol)
-    
-    # 2. Build Query List (Specific -> Broad)
     queries = []
     
-    # Query A: "Vestas Wind Systems earnings call transcript" (Best for EU stocks)
+    # Query 1: Name + Transcript (Most accurate)
     if name and name != symbol:
         queries.append(f"{name} earnings call transcript")
         
-    # Query B: "VWS earnings call transcript" (Ticker without suffix)
+    # Query 2: Ticker + Transcript
     base_ticker = symbol.split('.')[0]
-    if base_ticker != symbol:
-        queries.append(f"{base_ticker} earnings call transcript")
-        
-    # Query C: Fallback explicit site searches
-    if name:
-        queries.append(f"site:seekingalpha.com {name} earnings transcript")
+    queries.append(f"{base_ticker} earnings call transcript")
     
-    logger.info(f"🔎 Processing {symbol}. Name: {name}. Queries: {queries}")
+    logger.info(f"🔎 Processing {symbol} using Bing. Queries: {queries}")
     
     all_candidates = []
     
-    # 3. Execute Searches
     for q in queries:
-        links = search_ddg_html(q)
+        links = search_bing(q)
         valid = extract_valid_links(links)
         all_candidates.extend(valid)
         
-        # If we found good results, stop searching to save time
-        if len(all_candidates) >= 2:
-            break
-        
-        time.sleep(1) # Be polite to the search engine
+        if len(all_candidates) >= 2: break
+        time.sleep(1.5)
 
     if not all_candidates:
-        logger.error(f"❌ Zero candidates found for {symbol} after checking {len(queries)} queries.")
+        logger.error(f"❌ Zero candidates found for {symbol}")
         return []
 
-    # 4. Rank Candidates (Newest Year/Quarter first)
+    # Rank Candidates
     ranked = []
     for link, source in list(set(all_candidates)):
         slug = link.split('/')[-1].replace('-', ' ')
         y, q = parse_quarter_from_string(slug)
-        
-        # Score = Year * 10 + Quarter (e.g., 20241)
         score = (y * 10) + q
         
-        # Prioritize Sources: Investing.com > Seeking Alpha (SA often has paywalls)
         prio = 1
-        if "investing.com" in source.lower(): prio = 3
+        if "seekingalpha" in source.lower(): prio = 3
         if "fool.com" in source.lower(): prio = 2
         
-        ranked.append({
-            "score": score,
-            "prio": prio,
-            "url": link,
-            "source": source
-        })
+        ranked.append({ "score": score, "prio": prio, "url": link, "source": source })
 
-    # Sort: High Score (Date) -> High Prio (Source)
     ranked.sort(key=lambda x: (x['score'], x['prio']), reverse=True)
-    
-    # Return Top 3
     return [( (0,0), r['url'], r['source'] ) for r in ranked[:3]]
 
-# --- 4. FETCHING & PARSING (Standard) ---
+# --- 4. FETCHING & PARSING ---
 
-def extract_date(soup, source_label="Generic"):
-    """Attempts to extract the publication date from the soup."""
-    date_str = "Unknown Date"
+def extract_date(soup):
     try:
-        text_start = soup.get_text()[:2000]
-        # Look for "Oct 24, 2024" or "2024-10-24"
-        match = re.search(r'(\w{3}\s+\d{1,2},?\s+\d{4})|(\d{4}-\d{2}-\d{2})', text_start)
-        if match:
-            return match.group(0)
+        text = soup.get_text()[:2000]
+        match = re.search(r'(\w{3}\s+\d{1,2},?\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
+        if match: return match.group(0)
     except: pass
-    return date_str
+    return "Unknown Date"
 
-def parse_generic_soup(soup, url, symbol, source_label):
-    # Remove junk
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+def parse_generic_soup(soup, url, symbol, source):
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
         tag.decompose()
         
-    paragraphs = soup.find_all('p')
-    clean_text = []
+    # Heuristic: Find the element with the most <p> tags
+    max_p_count = 0
+    content_div = None
     
+    candidates = soup.find_all(['div', 'article', 'section'])
+    for c in candidates:
+        p_count = len(c.find_all('p', recursive=False)) # Direct children preferred
+        if p_count > max_p_count:
+            max_p_count = p_count
+            content_div = c
+            
+    # Fallback to just all P tags if no clear container
+    if not content_div or max_p_count < 3:
+        paragraphs = soup.find_all('p')
+    else:
+        paragraphs = content_div.find_all('p')
+        
+    clean_text = []
     for p in paragraphs:
         txt = p.get_text().strip()
-        if len(txt) > 40: # Filter short menu items
-            clean_text.append(txt)
+        if len(txt) > 40: clean_text.append(txt)
             
     if len(clean_text) < 5: return None, {"error": "Content too short"}
     
-    full_text = "\n\n".join(clean_text)
-    title = soup.title.string.strip() if soup.title else "No Title"
-    
-    return full_text, {
-        "source": source_label,
-        "url": url,
-        "symbol_used": symbol,
-        "title": title,
+    return "\n\n".join(clean_text), {
+        "source": source, "url": url, "symbol_used": symbol,
+        "title": soup.title.string.strip() if soup.title else "No Title",
         "date": extract_date(soup)
     }
 
 def fetch_page(url, source, symbol):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
-    
     try:
         session = requests.Session(impersonate="chrome120")
         resp = session.get(url, headers=headers, timeout=25)
+        if resp.status_code != 200: return None, {"error": f"Status {resp.status_code}"}
         
-        if resp.status_code != 200:
-            return None, {"error": f"Status {resp.status_code}"}
-            
         soup = BeautifulSoup(resp.content, 'html.parser')
+        if "captcha" in (soup.title.string or "").lower(): return None, {"error": "Blocked by CAPTCHA"}
         
-        # Check for CAPTCHA title
-        if "captcha" in (soup.title.string or "").lower():
-            return None, {"error": "Blocked by CAPTCHA"}
-
-        # Route to parsers (For now, generic works for 90% of transcript sites)
         return parse_generic_soup(soup, url, symbol, source)
-        
     except Exception as e:
         return None, {"error": str(e)}
 
-# --- 5. MAIN ENTRY POINT ---
+# --- 5. MAIN ---
 
 def get_transcript_data(ticker):
     try:
-        # Step 1: Find URLs
         candidates = find_transcript_candidates(ticker)
-        
-        if not candidates:
-            return None, {"error": "No candidates found"}
+        if not candidates: return None, {"error": "No candidates found"}
 
-        # Step 2: Fetch Content (Try top 3)
         for _, url, source in candidates:
-            logger.info(f"Trying to fetch: {url}")
+            logger.info(f"Attempting fetch: {url}")
             text, meta = fetch_page(url, source, ticker)
-            if text:
-                return text, meta
+            if text: return text, meta
                 
-        return None, {"error": "Candidates found but parsing failed (Paywall/Captcha)"}
-        
+        return None, {"error": "Candidates found but parsing failed"}
     except Exception as e:
         logger.error(f"Scraper Exception: {e}")
         return None, {"error": str(e)}
