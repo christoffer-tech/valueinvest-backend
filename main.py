@@ -6,6 +6,8 @@ import yfinance as yf
 import pandas as pd
 from defeatbeta_api.data.ticker import Ticker
 from jp_scraper import scrape_japanese_transcript
+# Import the new scraper module
+from scraper import get_transcript_data
 
 app = Flask(__name__)
 CORS(app)
@@ -56,42 +58,63 @@ def get_transcript(symbol):
                 "debug_logs": logs if logs else [str(e)]
             }), 500
 
-    # --- 2. US STOCK HANDLER (DefeatBeta) ---
+    # --- 2. US STOCK HANDLER (Primary: DefeatBeta) ---
     try:
-        print(f"Fetching transcript for {symbol}...")
+        print(f"Fetching transcript for {symbol} via DefeatBeta...")
         ticker = Ticker(symbol)
         transcripts = ticker.earning_call_transcripts()
         
         available_df = transcripts.get_transcripts_list()
-        if available_df is None or available_df.empty:
-             return jsonify({"error": "No transcripts found"}), 404
-        
-        latest = available_df.sort_values(['fiscal_year', 'fiscal_quarter'], ascending=False).iloc[0]
-        year = int(latest['fiscal_year'])
-        quarter = int(latest['fiscal_quarter'])
-        
-        raw_data = transcripts.get_transcript(year, quarter)
-        
-        if raw_data is None or raw_data.empty:
-             return jsonify({"error": "Transcript content empty"}), 404
-
-        full_text = f"EARNINGS TRANSCRIPT: {symbol} | FY{year} Q{quarter}\n====================================\n"
-        for _, row in raw_data.iterrows():
-            speaker = row['speaker'].upper() if row['speaker'] else "UNKNOWN"
-            content = row['content']
-            full_text += f"[{speaker}]: {content}\n\n"
+        if available_df is not None and not available_df.empty:
+            latest = available_df.sort_values(['fiscal_year', 'fiscal_quarter'], ascending=False).iloc[0]
+            year = int(latest['fiscal_year'])
+            quarter = int(latest['fiscal_quarter'])
             
-        return jsonify({
-            "symbol": symbol,
-            "year": year,
-            "quarter": quarter,
-            "transcript": full_text,
-            "source": "DefeatBeta"
-        })
+            raw_data = transcripts.get_transcript(year, quarter)
+            
+            if raw_data is not None and not raw_data.empty:
+                full_text = f"EARNINGS TRANSCRIPT: {symbol} | FY{year} Q{quarter}\n====================================\n"
+                for _, row in raw_data.iterrows():
+                    speaker = row['speaker'].upper() if row['speaker'] else "UNKNOWN"
+                    content = row['content']
+                    full_text += f"[{speaker}]: {content}\n\n"
+                    
+                return jsonify({
+                    "symbol": symbol,
+                    "year": year,
+                    "quarter": quarter,
+                    "transcript": full_text,
+                    "source": "DefeatBeta"
+                })
+            else:
+                print("DefeatBeta returned empty content. Proceeding to fallback...")
+        else:
+            print("DefeatBeta found no transcript list. Proceeding to fallback...")
 
     except Exception as e:
-        print(f"Transcript Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"DefeatBeta Error: {e}. Proceeding to fallback...")
+
+    # --- 3. US STOCK HANDLER (Fallback: Custom Scraper) ---
+    try:
+        print(f"Attempting Fallback Scraper for {symbol}...")
+        transcript_text, meta = get_transcript_data(symbol)
+        
+        if transcript_text:
+            return jsonify({
+                "symbol": symbol,
+                "transcript": transcript_text,
+                "source": f"Scraper ({meta.get('source', 'Unknown')})",
+                "meta": meta
+            })
+        
+        return jsonify({
+            "error": "No transcripts found via DefeatBeta or Scraper",
+            "details": meta if 'meta' in locals() and meta else "No candidates found"
+        }), 404
+
+    except Exception as e:
+        print(f"Scraper Error: {e}")
+        return jsonify({"error": f"All methods failed. Last error: {str(e)}"}), 500
 
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
