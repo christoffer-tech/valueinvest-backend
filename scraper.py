@@ -22,33 +22,32 @@ except ImportError:
     SESSION_TYPE = "standard"
     logger.warning("⚠️ curl_cffi not found. Using standard requests.")
 
-# --- 2. INTELLIGENT TICKER LOGIC (From Colab) ---
+# --- 2. SESSION FACTORY ---
 
-def normalize_ticker(symbol):
-    """Converts tickers to standard formats (e.g. VWS.CO -> VWS.CO)."""
-    if not symbol or '.' not in symbol:
-        return symbol
-    parts = symbol.split('.')
-    base = parts[0]
-    suffix = parts[1].upper()
-    # Map common suffixes to Yahoo/Investing standards
-    mapping = {
-        'TOK': 'T', 'PAR': 'PA', 'LON': 'L', 'TRT': 'TO',
-        'AMS': 'AS', 'BRU': 'BR', 'ETR': 'DE', 'FRA': 'F', 'HKG': 'HK',
-        'CPH': 'CO' 
+def get_session():
+    """Generates a session with a random realistic browser fingerprint."""
+    # Rotate Chrome versions to avoid static fingerprinting
+    ver = random.choice(["120", "121", "122", "123", "124"])
+    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
+
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/"
     }
-    if suffix in mapping:
-        return f"{base}.{mapping[suffix]}"
-    return symbol
+
+    if SESSION_TYPE == "cffi":
+        # curl_cffi impersonate handles the TLS handshake signature
+        return cffi_requests.Session(impersonate="chrome120", headers=headers)
+    else:
+        s = std_requests.Session()
+        s.headers.update(headers)
+        return s
 
 def resolve_name(ticker):
-    """
-    Resolves ticker to company name for better search results.
-    """
-    normalized = normalize_ticker(ticker)
-    t = normalized.split('.')[0] # Strip suffix for mapping check
-    
-    # Hardcoded map for difficult tickers
+    """Normalize ticker and map to company name."""
+    t = ticker.upper().split('.')[0]
     mapping = {
         "VWS": "Vestas Wind Systems",
         "VWDRY": "Vestas Wind Systems",
@@ -58,116 +57,116 @@ def resolve_name(ticker):
         "MSFT": "Microsoft",
         "NVDA": "Nvidia"
     }
-    return mapping.get(t, normalized)
+    return mapping.get(t, t)
 
-def parse_quarter_score(text):
-    """
-    Scores a URL/Title based on recency.
-    Higher Score = Newer Transcript.
-    """
-    if not text: return 0
-    text = text.upper()
-    
-    # Extract Year
-    year_match = re.search(r'20(\d{2})', text)
-    year = int("20" + year_match.group(1)) if year_match else 2020
-    
-    # Extract Quarter
-    q_map = {
-        "Q1": 1, "1Q": 1, "FIRST": 1,
-        "Q2": 2, "2Q": 2, "SECOND": 2, "HALF": 2,
-        "Q3": 3, "3Q": 3, "THIRD": 3,
-        "Q4": 4, "4Q": 4, "FOURTH": 4, "FY": 4
-    }
-    quarter = 0
-    for k, v in q_map.items():
-        if k in text:
-            quarter = v
-            break
-            
-    # Score = Year * 10 + Quarter (e.g., 2025 Q3 = 20253)
-    return (year * 10) + quarter
+# --- 3. MULTI-ENGINE SEARCH ---
 
-# --- 3. SESSION FACTORY ---
-
-def get_session(mobile=False):
-    if mobile:
-        ua = f"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(120, 130)}.0.0.0 Mobile Safari/537.36"
-    else:
-        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(120, 130)}.0.0.0 Safari/537.36"
-
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
-    }
-
-    if SESSION_TYPE == "cffi":
-        return cffi_requests.Session(impersonate="chrome120", headers=headers)
-    else:
-        s = std_requests.Session()
-        s.headers.update(headers)
-        return s
-
-# --- 4. SEARCH & FILTERING ---
-
-def clean_yahoo_url(raw_url):
+def search_duckduckgo(query):
+    """Engine 1: DuckDuckGo Lite (HTML)"""
     try:
-        decoded = urllib.parse.unquote(raw_url)
-        match = re.search(r'(https?://(?:www\.)?investing\.com/[^\s&/]+(?:/[^\s&]+)*)', decoded)
-        if match: return match.group(1)
-        return None
-    except: return None
-
-def search_yahoo(query):
-    try:
-        full_query = f"{query} site:investing.com earnings call transcript"
-        url = "https://search.yahoo.com/search"
-        params = {'p': full_query, 'ei': 'UTF-8', 'n': 10}
+        url = "https://html.duckduckgo.com/html/"
+        data = {'q': query + " site:investing.com earnings call transcript"}
+        sess = get_session()
+        resp = sess.post(url, data=data, timeout=10)
         
+        if resp.status_code != 200: return []
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        links = []
+        for a in soup.find_all('a', class_='result__a', href=True):
+            links.append(a['href'])
+        return links
+    except: return []
+
+def search_ask(query):
+    """Engine 2: Ask.com (Very resilient to Cloud IPs)"""
+    try:
+        # Ask.com is great because it has weaker bot protection than Google/Bing
+        url = "https://www.ask.com/web"
+        params = {'q': query + " site:investing.com transcript"}
         sess = get_session()
         resp = sess.get(url, params=params, timeout=10)
-        if resp.status_code != 200: return []
         
+        if resp.status_code != 200: return []
         soup = BeautifulSoup(resp.content, 'html.parser')
+        
         links = []
         for a in soup.find_all('a', href=True):
-            raw_href = a['href']
-            if "investing.com" in raw_href or "yahoo.com" in raw_href:
-                cleaned = clean_yahoo_url(raw_href)
-                if cleaned: links.append(cleaned)
-        return list(set(links))
-    except Exception as e:
-        logger.error(f"Yahoo Error: {e}")
-        return []
+            # Ask.com results are usually clean URLs
+            if "investing.com" in a['href']:
+                links.append(a['href'])
+        return links
+    except: return []
+
+def search_yahoo(query):
+    """Engine 3: Yahoo (Fallback)"""
+    try:
+        url = "https://search.yahoo.com/search"
+        params = {'p': query + " site:investing.com earnings call transcript"}
+        sess = get_session()
+        resp = sess.get(url, params=params, timeout=10)
+        
+        if resp.status_code != 200: return []
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            # Clean Yahoo Redirects
+            if "RU=" in href:
+                try:
+                    start = href.find("RU=") + 3
+                    end = href.find("/RK=")
+                    if end == -1: end = len(href)
+                    href = urllib.parse.unquote(href[start:end])
+                except: pass
+            if "investing.com" in href:
+                links.append(href)
+        return links
+    except: return []
 
 def get_candidates(ticker):
     name = resolve_name(ticker)
-    logger.info(f"🔎 Searching Yahoo for: {name}")
+    logger.info(f"🔎 Orchestrating Search for: {name}")
     
-    raw_links = search_yahoo(name)
-    logger.info(f"✅ Yahoo found {len(raw_links)} raw links")
-    
-    valid_candidates = []
-    for l in raw_links:
-        if "investing.com" in l and ("transcript" in l.lower() or "earnings" in l.lower()):
-             if "/news/" in l or "/equities/" in l or "/stock-market-news/" in l:
-                 # Calculate Recency Score
-                 score = parse_quarter_score(l)
-                 valid_candidates.append({'url': l, 'score': score})
-    
-    # Sort by Score (Desc) -> Newest First
-    valid_candidates.sort(key=lambda x: x['score'], reverse=True)
-    
-    # Return just the URLs
-    sorted_urls = [x['url'] for x in valid_candidates]
-    logger.info(f"✅ Filtered to {len(sorted_urls)} valid candidates (Newest First).")
-    return sorted_urls
+    # 1. Try DuckDuckGo
+    links = search_duckduckgo(name)
+    if links:
+        logger.info(f"✅ DuckDuckGo found {len(links)} links")
+        return filter_links(links)
 
-# --- 5. FETCHING (Google Cache + Archive Fallback) ---
+    # 2. Try Ask.com (Great fallback)
+    logger.info("⚠️ DDG blocked. Switching to Ask.com...")
+    links = search_ask(name)
+    if links:
+        logger.info(f"✅ Ask.com found {len(links)} links")
+        return filter_links(links)
+
+    # 3. Try Yahoo
+    logger.info("⚠️ Ask.com blocked. Switching to Yahoo...")
+    links = search_yahoo(name)
+    if links:
+        logger.info(f"✅ Yahoo found {len(links)} links")
+        return filter_links(links)
+
+    return []
+
+def filter_links(raw_links):
+    valid = []
+    seen = set()
+    for l in raw_links:
+        if l in seen: continue
+        seen.add(l)
+        # Strict Transcript Filter
+        if "investing.com" in l and ("/news/" in l or "/equities/" in l):
+            if "transcript" in l.lower() or "earnings" in l.lower():
+                valid.append(l)
+    return valid
+
+# --- 4. FETCHING (Google Cache) ---
 
 def clean_text(soup):
-    # Try multiple containers
+    # Try different content containers
     body = soup.find('div', class_='WYSIWYG') or \
            soup.find('div', class_='articlePage') or \
            soup.find('div', id='article-content') or \
@@ -189,72 +188,52 @@ def clean_text(soup):
     return "\n\n".join(text_parts)
 
 def fetch_google_cache(url):
-    """Strategy A: Google Cache (Text Only)"""
+    """Fetches text-only version from Google Cache."""
     try:
+        # strip=1 is vital - removes all JS/CSS/Images
         cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{urllib.parse.quote(url)}&strip=1&vwsrc=0"
         logger.info(f"🛡️ Google Cache: {cache_url}")
         
         sess = get_session()
+        # Cache usually requires a simple desktop UA
         sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
         
         resp = sess.get(cache_url, timeout=15)
+        
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content, 'html.parser')
             text = clean_text(soup)
-            if not text: text = soup.get_text() # Fallback
+            if not text: text = soup.get_text()
             return text
         return None
     except: return None
 
-def fetch_archive_org(url):
-    """Strategy B: Wayback Machine (From Colab Script)"""
-    try:
-        logger.info(f"🏛️ Checking Archive.org for: {url}")
-        api_url = f"https://archive.org/wayback/available?url={url}"
-        
-        sess = get_session()
-        resp = sess.get(api_url, timeout=15)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('archived_snapshots', {}).get('closest', {}):
-                snapshot_url = data['archived_snapshots']['closest']['url']
-                logger.info(f"   ↳ Found Snapshot: {snapshot_url}")
-                
-                resp_snap = sess.get(snapshot_url, timeout=25)
-                if resp_snap.status_code == 200:
-                    soup = BeautifulSoup(resp_snap.content, 'html.parser')
-                    return clean_text(soup)
-        return None
-    except Exception as e:
-        logger.error(f"Archive Error: {e}")
-        return None
-
-# --- 6. MAIN ---
+# --- 5. MAIN ---
 
 def get_transcript_data(ticker):
     logger.info(f"🚀 STARTING SCRAPE FOR: {ticker}")
     
     # 1. Search
     candidates = get_candidates(ticker)
-    if not candidates:
-        return None, {"error": "No valid transcript links found."}
     
-    # 2. Fetch Loop
+    if not candidates:
+        logger.error("❌ All search engines returned 0 results (IP Blocked).")
+        return None, {"error": "All search engines blocked."}
+    
+    # 2. Fetch
     for link in candidates[:3]:
         logger.info(f"🔗 Target: {link}")
-        
-        # A. Google Cache (Fastest)
         text = fetch_google_cache(link)
+        
         if text and len(text) > 500:
-            return text, {"source": "Investing.com (Google Cache)", "url": link, "title": "Earnings Call", "symbol": ticker}
+            return text, {
+                "source": "Investing.com (Google Cache)",
+                "url": link,
+                "title": "Earnings Call",
+                "symbol": ticker
+            }
             
-        # B. Archive.org (Resilient Fallback)
-        text = fetch_archive_org(link)
-        if text and len(text) > 500:
-            return text, {"source": "Investing.com (Wayback Machine)", "url": link, "title": "Earnings Call", "symbol": ticker}
-
-    return None, {"error": "All candidates blocked or unavailable."}
+    return None, {"error": "Candidates found but download failed."}
 
 if __name__ == "__main__":
     t, m = get_transcript_data("VWS.CO")
