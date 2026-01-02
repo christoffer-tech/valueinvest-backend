@@ -12,3 +12,4 @@ curl-cffi
 pdf2image
 pytesseract
 Pillow
+pymupdf
