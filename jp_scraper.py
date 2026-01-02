@@ -17,6 +17,9 @@ GENAI_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_KEY:
     genai.configure(api_key=GENAI_KEY)
 
+# Configure Jina API (Optional, but recommended for stability)
+JINA_API_KEY = os.environ.get("JINA_API_KEY")
+
 TYPE_PRIORITY = {
     "HTML_TRANSCRIPT": 1,
     "PDF_TRANSCRIPT": 2,
@@ -65,12 +68,67 @@ def format_doc_header(item, label_override=None):
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
+# --- JINA FALLBACK HELPERS ---
+
+def jina_search_fallback(ticker, log_func=print):
+    """
+    Fallback: Uses Jina Search API if Yahoo scraping fails.
+    """
+    log_func(f"⚠️ Triggering Jina Search Fallback for {ticker}...")
+    query = f"site:finance.logmi.jp {ticker}"
+    url = f"https://s.jina.ai/{query}"
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if JINA_API_KEY:
+        headers['Authorization'] = f'Bearer {JINA_API_KEY}'
+        
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code == 200:
+            content = response.text
+            # Look for the company ID pattern in the markdown result
+            match = re.search(r'https://finance\.logmi\.jp/companies/\d+', content)
+            if match:
+                found_url = match.group(0)
+                log_func(f"✅ Jina found company URL: {found_url}")
+                return found_url
+            else:
+                log_func("❌ Jina Search returned results but no company URL found.")
+        else:
+            log_func(f"❌ Jina Search API failed with status {response.status_code}")
+    except Exception as e:
+        log_func(f"❌ Jina Search Error: {e}")
+        
+    return None
+
+def jina_reader_fallback(url, log_func=print):
+    """
+    Fallback: Uses Jina Reader API if local HTML parsing fails.
+    """
+    log_func(f"⚠️ Triggering Jina Reader Fallback for {url}...")
+    target = f"https://r.jina.ai/{url}"
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if JINA_API_KEY:
+        headers['Authorization'] = f'Bearer {JINA_API_KEY}'
+        
+    try:
+        response = requests.get(target, headers=headers, timeout=20)
+        if response.status_code == 200:
+            log_func("✅ Jina Reader successfully extracted text.")
+            return response.text
+        else:
+            log_func(f"❌ Jina Reader failed with status {response.status_code}")
+    except Exception as e:
+        log_func(f"❌ Jina Reader Error: {e}")
+    
+    return None
+
 # --- PYMUPDF TEXT EXTRACTOR ---
 def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
     text = ""
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            # Check if PDF is encrypted or empty
             if doc.is_encrypted:
                 log_func("⚠️ PDF is encrypted.")
                 return None
@@ -79,12 +137,10 @@ def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
             log_func(f"   (PDF has {total_pages} pages)")
             
             for page in doc:
-                # flags=fitz.TEXT_PRESERVE_WHITESPACE helps with layout
                 extracted = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
                 if extracted:
                     text += extracted + "\n"
             
-            # Heuristic: If text is extremely short relative to page count, it's likely images
             if len(text.strip()) < 100 and total_pages > 0:
                 log_func("⚠️ Extracted text is too short (likely image-based PDF).")
                 return None
@@ -97,10 +153,6 @@ def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
 
 # --- GEMINI VISION FALLBACK ---
 def process_vision_fallback(pdf_bytes, item, log_func=print):
-    """
-    Slices the first 15 pages of the PDF and sends them to Gemini 2.5 Flash
-    for direct analysis (OCR/Vision).
-    """
     if not GENAI_KEY:
         log_func("❌ Gemini API Key not found. Cannot perform vision fallback.")
         return None
@@ -108,17 +160,14 @@ def process_vision_fallback(pdf_bytes, item, log_func=print):
     log_func(f"👀 Initiating Gemini Vision Fallback for {item['type']}...")
 
     try:
-        # 1. Create a new PDF in memory with only the first 15 pages
         with fitz.open(stream=pdf_bytes, filetype="pdf") as src_doc:
             last_page = min(15, len(src_doc)) - 1
-            src_doc.select(range(last_page + 1)) # Keep only first 15 pages
+            src_doc.select(range(last_page + 1))
             trimmed_bytes = src_doc.tobytes()
             log_func(f"   Sliced PDF to first {last_page + 1} pages for analysis.")
 
-        # 2. Configure Model
-        model = genai.GenerativeModel('gemini-2.0-flash-exp') # Or 'gemini-1.5-flash' depending on access
+        model = genai.GenerativeModel('gemini-2.0-flash-exp') 
         
-        # 3. Prompt
         prompt = (
             "You are analyzing the first 15 slides of a Japanese financial presentation. "
             "Extract the key financial results (Revenue, Operating Profit), strategic highlights, "
@@ -126,7 +175,6 @@ def process_vision_fallback(pdf_bytes, item, log_func=print):
             "Output the data as a clean text summary."
         )
 
-        # 4. Generate
         log_func("   Sending to Gemini...")
         response = model.generate_content([
             prompt,
@@ -149,6 +197,7 @@ def stitch_html_transcript(item, log_func=print):
     
     log_func(f"Stitching HTML: {url}")
     
+    # 1. Try Local Scraping Loop
     while page < 15:
         target = f"{url}?page={page}" if page > 1 else url
         soup = get_soup(target, log_func)
@@ -184,8 +233,17 @@ def stitch_html_transcript(item, log_func=print):
         if not next_btn: 
             break
         page += 1
+    
+    result_text = "\n\n".join(full_text)
+
+    # 2. Fallback: If local scraping yielded nothing, try Jina Reader
+    if not result_text or len(result_text) < 100:
+        log_func("⚠️ Local HTML stitching yielded insufficient text. Attempting Jina Reader fallback...")
+        jina_text = jina_reader_fallback(url, log_func)
+        if jina_text:
+            return jina_text
         
-    return "\n\n".join(full_text)
+    return result_text
 
 def analyze_company_page(soup, logs):
     items = []
@@ -257,114 +315,119 @@ def scrape_japanese_transcript(ticker):
     log(f"Starting scrape for {ticker}")
     clean_ticker = ticker.replace('.T', '').strip()
     
+    # --- PHASE 1: SEARCH ---
+    # Attempt 1: Yahoo Japan Search (Local/Fast)
     query = f"{clean_ticker} ログミー"
     search_url = f"https://search.yahoo.co.jp/search?p={query}"
     
     log(f"Searching: {search_url}")
+    company_url = None
     
     try:
         soup = get_soup(search_url, log)
-        if not soup: return None, logs
-        
-        company_url = None
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if 'finance.logmi.jp/companies/' in href:
-                company_url = href
-                if 'RU=' in company_url:
-                    try:
-                        import urllib.parse
-                        qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
-                        if 'RU' in qs: company_url = qs['RU'][0]
-                    except: pass
-                break
-        
-        if not company_url:
-             for link in soup.find_all('a', href=True):
+        if soup:
+            for link in soup.find_all('a', href=True):
                 href = link['href']
-                if 'finance.logmi.jp/articles/' in href:
-                    log(f"Found Direct Article URL: {href}")
-                    return stitch_html_transcript({'url': href}, log), logs
-
-        if not company_url:
-            log("Company URL not found.")
-            return None, logs
-
-        log(f"Found Company URL: {company_url}")
-
-        soup = get_soup(company_url, log)
-        if not soup: return None, logs
-        
-        items = analyze_company_page(soup, logs)
-        if not items:
-            log("No items found on company page.")
-            return None, logs
-
-        # Sort: Latest date first, then by priority (Transcript < Presentation < Tanshin)
-        items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
-        latest_date = items[0]['date']
-        
-        # Get all recent items (last 14 days from latest event)
-        window_start = latest_date - timedelta(days=14)
-        candidates = [i for i in items if i['date'] >= window_start]
-        candidates.sort(key=lambda x: x['priority']) # Sort by Priority
-        
-        final_text = ""
-        best_pdf_for_fallback = None
-        best_pdf_bytes = None
-        
-        # --- PHASE 1: Try to extract Pure Text ---
-        for doc in candidates:
-            log(f"⬇️ Processing Candidate: {doc['type']} ({doc['date'].strftime('%Y-%m-%d')})")
+                if 'finance.logmi.jp/companies/' in href:
+                    company_url = href
+                    if 'RU=' in company_url:
+                        try:
+                            import urllib.parse
+                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(company_url).query)
+                            if 'RU' in qs: company_url = qs['RU'][0]
+                        except: pass
+                    break
             
-            try:
-                if doc['type'] == 'HTML_TRANSCRIPT':
-                    txt = stitch_html_transcript(doc, log)
-                    if txt and len(txt) > 200:
-                        final_text = format_doc_header(doc) + txt
-                        return final_text, logs
-                else:
-                    # It's a PDF
-                    log(f"   Downloading PDF...")
-                    r = requests.get(doc['url'], headers=get_headers(), timeout=30)
-                    r.raise_for_status()
-                    pdf_data = r.content
-                    
-                    # Store as potential fallback if it's a Presentation/Tanshin
-                    if not best_pdf_for_fallback and doc['type'] in ['PDF_PRESENTATION', 'PDF_TANSHIN']:
-                        best_pdf_for_fallback = doc
-                        best_pdf_bytes = pdf_data
-                    
-                    # Try PyMuPDF Extraction
-                    txt = extract_text_from_pdf_bytes(pdf_data, log)
-                    if txt and len(txt) > 200:
-                        log(f"✅ Success! Extracted text from {doc['type']}.")
-                        final_text = format_doc_header(doc) + txt
-                        return final_text, logs
-                    
-            except Exception as e:
-                log(f"❌ Failed to process {doc['type']}: {e}")
-                continue
+            # Check for direct article link if company page not found
+            if not company_url:
+                 for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if 'finance.logmi.jp/articles/' in href:
+                        log(f"Found Direct Article URL: {href}")
+                        return stitch_html_transcript({'url': href}, log), logs
 
-        # --- PHASE 2: Fallback (Vision Analysis) ---
-        # If we are here, we have no text. 
-        # If we have a stored PDF (Presentation/Tanshin), send slides to Gemini.
-        if best_pdf_for_fallback and best_pdf_bytes:
-            log("⚠️ Text extraction failed for all docs. Attempting Gemini Vision fallback...")
-            
-            vision_text = process_vision_fallback(best_pdf_bytes, best_pdf_for_fallback, log)
-            
-            if vision_text:
-                header = format_doc_header(best_pdf_for_fallback, label_override="VISION ANALYSIS OF SLIDES")
-                final_text = header + vision_text
-                return final_text, logs
-            else:
-                log("❌ Vision fallback failed or produced no output.")
-
-        return None, logs
-            
     except Exception as e:
-        log(f"Global Scraper Error: {e}")
+        log(f"Yahoo Search encountered an error: {e}")
+
+    # Attempt 2: Jina Search Fallback (If Yahoo failed or yielded nothing)
+    if not company_url:
+        log("⚠️ Yahoo Search failed to find company URL. Attempting Jina Fallback...")
+        company_url = jina_search_fallback(clean_ticker, log)
+
+    if not company_url:
+        log("❌ Company URL not found via Yahoo or Jina.")
         return None, logs
+
+    log(f"✅ Target Company URL: {company_url}")
+
+    # --- PHASE 2: ANALYZE COMPANY PAGE ---
+    soup = get_soup(company_url, log)
+    if not soup: return None, logs
     
+    items = analyze_company_page(soup, logs)
+    if not items:
+        log("No items found on company page.")
+        return None, logs
+
+    # Sort: Latest date first, then by priority
+    items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
+    latest_date = items[0]['date']
+    
+    # Get all recent items (last 14 days from latest event)
+    window_start = latest_date - timedelta(days=14)
+    candidates = [i for i in items if i['date'] >= window_start]
+    candidates.sort(key=lambda x: x['priority']) 
+    
+    final_text = ""
+    best_pdf_for_fallback = None
+    best_pdf_bytes = None
+    
+    # --- PHASE 3: EXTRACT CONTENT ---
+    for doc in candidates:
+        log(f"⬇️ Processing Candidate: {doc['type']} ({doc['date'].strftime('%Y-%m-%d')})")
+        
+        try:
+            if doc['type'] == 'HTML_TRANSCRIPT':
+                # This function now contains the Jina Reader fallback inside it
+                txt = stitch_html_transcript(doc, log)
+                if txt and len(txt) > 200:
+                    final_text = format_doc_header(doc) + txt
+                    return final_text, logs
+            else:
+                # It's a PDF
+                log(f"   Downloading PDF...")
+                r = requests.get(doc['url'], headers=get_headers(), timeout=30)
+                r.raise_for_status()
+                pdf_data = r.content
+                
+                # Store as potential fallback if it's a Presentation/Tanshin
+                if not best_pdf_for_fallback and doc['type'] in ['PDF_PRESENTATION', 'PDF_TANSHIN']:
+                    best_pdf_for_fallback = doc
+                    best_pdf_bytes = pdf_data
+                
+                # Try PyMuPDF Extraction
+                txt = extract_text_from_pdf_bytes(pdf_data, log)
+                if txt and len(txt) > 200:
+                    log(f"✅ Success! Extracted text from {doc['type']}.")
+                    final_text = format_doc_header(doc) + txt
+                    return final_text, logs
+                
+        except Exception as e:
+            log(f"❌ Failed to process {doc['type']}: {e}")
+            continue
+
+    # --- PHASE 4: VISION FALLBACK ---
+    # If text extraction (local + Jina Reader) failed, try Vision on slides
+    if best_pdf_for_fallback and best_pdf_bytes:
+        log("⚠️ Text extraction failed for all docs. Attempting Gemini Vision fallback...")
+        
+        vision_text = process_vision_fallback(best_pdf_bytes, best_pdf_for_fallback, log)
+        
+        if vision_text:
+            header = format_doc_header(best_pdf_for_fallback, label_override="VISION ANALYSIS OF SLIDES")
+            final_text = header + vision_text
+            return final_text, logs
+        else:
+            log("❌ Vision fallback failed or produced no output.")
+
     return None, logs
