@@ -4,93 +4,59 @@ import warnings
 import logging
 import re
 import time
-import random
 import urllib.parse
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from datetime import datetime
 
-# --- 1. CONFIGURATION & LOGGING ---
-os.environ['PYTHONWARNINGS'] = 'ignore'
-warnings.simplefilter("ignore")
-logging.captureWarnings(True)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+# --- 1. CONFIGURATION ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S',
+    force=True
+)
 logger = logging.getLogger(__name__)
 
-# --- 2. COMPANY NAME RESOLUTION ---
+# --- 2. SEARCH LOGIC (FIXED) ---
 
-def clean_company_name(name):
-    if not name: return name
-    suffixes = [
-        r' co\.,? ?ltd\.?$', r' co,? ?ltd\.?$', r' ltd\.?$',
-        r' inc\.?$', r' corp\.?$', r' corporation$', r' plc$',
-        r' s\.a\.$', r' n\.v\.$', r' k\.k\.$', r' kabushiki kaisha$',
-        r' adr$', r' \(adr\)$', r' a/s$', r' ag$', r' ab$'
-    ]
-    clean = name.strip()
-    for pattern in suffixes:
-        clean = re.sub(pattern, '', clean, flags=re.IGNORECASE)
-    return clean.strip()
-
-def get_company_name_lightweight(symbol):
+def search_bing_broad(query):
+    """
+    Searches Bing broadly (without strict site: operators) to avoid 0-result blocks.
+    """
     try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={symbol}&quotesCount=1&newsCount=0"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, timeout=5)
-        data = r.json()
-        if 'quotes' in data and len(data['quotes']) > 0:
-            found = data['quotes'][0].get('longname') or data['quotes'][0].get('shortname')
-            if found:
-                return clean_company_name(found)
-    except:
-        pass
-    if "." in symbol: return symbol.split(".")[0]
-    return symbol
-
-def parse_quarter_from_string(text):
-    if not text: return (0, 0)
-    text = text.upper()
-    year_match = re.search(r'20(\d{2})', text)
-    year = int("20" + year_match.group(1)) if year_match else 0
-    q_map = {"Q1": 1, "1Q": 1, "FIRST": 1, "Q2": 2, "2Q": 2, "SECOND": 2, "HALF": 2, "Q3": 3, "3Q": 3, "THIRD": 3, "Q4": 4, "4Q": 4, "FOURTH": 4, "FY": 4}
-    quarter = 0
-    for k, v in q_map.items():
-        if k in text:
-            quarter = v
-            break
-    return (year, quarter)
-
-# --- 3. ROBUST SEARCH (BING -> INVESTING.COM ONLY) ---
-
-def search_bing(query):
-    try:
-        # We append 'site:investing.com' here to force Bing to only look there
-        full_query = f"site:investing.com {query}"
+        # We add 'investing.com' as a keyword, not a strict operator
+        full_query = f"{query} investing.com"
         url = f"https://www.bing.com/search?q={urllib.parse.quote(full_query)}&setmkt=en-US"
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
+        
+        # Use curl_cffi to mimic a real Chrome browser
         session = requests.Session(impersonate="chrome120")
         resp = session.get(url, headers=headers, timeout=20)
         
-        if resp.status_code != 200: return []
+        if resp.status_code != 200: 
+            return []
 
         soup = BeautifulSoup(resp.content, 'html.parser')
         links = []
+        
+        # Extract all result links
         for h2 in soup.find_all('h2'):
             a = h2.find('a', href=True)
             if a: links.append(a['href'])
         
-        logger.info(f"Bing found {len(links)} links for '{full_query}'")
         return links
     except Exception as e:
-        logger.error(f"Bing Error: {e}")
+        logger.error(f"Search Error: {e}")
         return []
 
-def extract_valid_links(raw_links):
+def filter_investing_links(raw_links):
+    """
+    Filters raw links for valid Investing.com transcripts.
+    """
     valid = []
     seen = set()
 
@@ -99,138 +65,127 @@ def extract_valid_links(raw_links):
         seen.add(link)
         l = link.lower()
         
-        # STRICT FILTER: Must be investing.com
-        if "investing.com" not in l:
-            continue
+        # 1. MUST be investing.com
+        if "investing.com" not in l: continue
 
-        # Must look like a transcript url
-        # investing.com URLs usually look like /equities/apple-computer-inc-earnings-calls-transcripts
-        # or /news/stock-market-news/earnings-call-transcript
-        if "earnings" in l and ("transcript" in l or "call" in l):
-            valid.append((link, "Investing.com"))
+        # 2. MUST be a transcript or news article
+        # Valid patterns:
+        # - /news/transcripts/earnings-call-transcript...
+        # - /equities/vestas...earnings-calls-transcripts
+        if "/news/" in l or "/equities/" in l:
+            if "transcript" in l or "earnings-call" in l:
+                valid.append(link)
 
     return valid
 
-def find_transcript_candidates(symbol):
-    name = get_company_name_lightweight(symbol)
-    queries = []
+def parse_quarter_score(url):
+    """Scores URLs based on recency (Year/Quarter) found in the slug."""
+    # Heuristic: Higher score = Newer
+    # Extract year
+    year_match = re.search(r'20(\d{2})', url)
+    year = int("20" + year_match.group(1)) if year_match else 2020
     
-    # 1. Best: "Vestas Wind Systems earnings call transcript"
-    if name and name != symbol:
-        queries.append(f"{name} earnings call transcript")
-    
-    # 2. Backup: "VWS earnings call transcript"
-    base_ticker = symbol.split('.')[0]
-    queries.append(f"{base_ticker} earnings call transcript")
-    
-    logger.info(f"🔎 Searching Investing.com for {symbol} ({name})...")
-    
-    all_candidates = []
-    for q in queries:
-        links = search_bing(q)
-        valid = extract_valid_links(links)
-        all_candidates.extend(valid)
-        if len(all_candidates) >= 2: break
-        time.sleep(1.5)
+    # Extract quarter
+    q_map = {"q1": 1, "q2": 2, "q3": 3, "q4": 4}
+    q = 0
+    for k, v in q_map.items():
+        if k in url.lower():
+            q = v
+            break
+            
+    return (year * 10) + q
 
-    if not all_candidates:
-        logger.error(f"❌ Zero Investing.com transcripts found for {symbol}")
-        return []
+# --- 3. PAGE PARSER ---
 
-    # Rank by Date in URL
-    ranked = []
-    for link, source in list(set(all_candidates)):
-        slug = link.split('/')[-1].replace('-', ' ')
-        y, q = parse_quarter_from_string(slug)
-        score = (y * 10) + q
-        ranked.append({ "score": score, "url": link })
-
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-    return [( (0,0), r['url'], "Investing.com" ) for r in ranked[:3]]
-
-# --- 4. INVESTING.COM SPECIFIC PARSER ---
-
-def parse_investing_com(soup, url, symbol):
-    # Investing.com usually puts content in <div class="WYSIWYG articlePage">
-    content_div = soup.find('div', class_='WYSIWYG') or \
-                  soup.find('div', class_='articlePage') or \
-                  soup.find('div', id='article-content')
-                  
-    if not content_div:
-        return None, {"error": "Could not find Investing.com content div"}
-
-    # Remove junk inside the article
-    for tag in content_div(["script", "style", "iframe", "div"]):
-        # Investing.com puts ads in divs inside the text, remove them
-        # BUT be careful not to remove text divs. Usually ads have specific classes.
-        if tag.name == 'div' and tag.get('class'):
-             # Generic ad classes often used
-             if any(c in str(tag.get('class')) for c in ['related', 'img', 'video', 'carousel']):
-                 tag.decompose()
-        elif tag.name in ['script', 'style', 'iframe']:
-             tag.decompose()
-
-    # Extract text cleanly
-    text_content = []
-    for tag in content_div.find_all(['p', 'h2']):
-        txt = tag.get_text().strip()
-        if not txt: continue
-        if "Position:" in txt: continue # Signature line
-        if "Have a confidential tip" in txt: continue
-        text_content.append(txt)
-
-    if len(text_content) < 5:
-        return None, {"error": "Content too short (maybe paywalled?)"}
-
-    # Extract Date
-    date_str = "Unknown Date"
-    date_div = soup.find('div', class_='contentSectionDetails')
-    if date_div:
-        span = date_div.find('span')
-        if span: date_str = span.get_text().replace("Published", "").strip()
-
-    return "\n\n".join(text_content), {
-        "source": "Investing.com",
-        "url": url,
-        "symbol_used": symbol,
-        "title": soup.title.string.strip() if soup.title else "Investing.com Transcript",
-        "date": date_str
-    }
-
-def fetch_page(url, source, symbol):
+def fetch_transcript_text(url):
     try:
+        logger.info(f"📥 Fetching: {url}")
+        
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
+        
         session = requests.Session(impersonate="chrome120")
         resp = session.get(url, headers=headers, timeout=25)
         
-        if resp.status_code != 200: return None, {"error": f"Status {resp.status_code}"}
-        
+        if resp.status_code != 200:
+            return None, f"Status {resp.status_code}"
+
         soup = BeautifulSoup(resp.content, 'html.parser')
         
-        if "captcha" in (soup.title.string or "").lower():
-            return None, {"error": "Blocked by CAPTCHA"}
-            
-        return parse_investing_com(soup, url, symbol)
+        # 1. Locate Content
+        # Investing.com article body is usually in 'WYSIWYG' or 'articlePage' class
+        body = soup.find('div', class_='WYSIWYG') or soup.find('div', class_='articlePage')
         
+        if not body:
+            return None, "Could not find article body div"
+
+        # 2. Clean Junk (Ads, etc)
+        for tag in body(["script", "style", "iframe"]):
+            tag.decompose()
+        
+        # Remove 'Related Articles' divs
+        for div in body.find_all('div'):
+            if "related" in str(div.get('class', [])) or "carousel" in str(div.get('class', [])):
+                div.decompose()
+
+        # 3. Extract Text
+        paragraphs = [p.get_text().strip() for p in body.find_all(['p', 'h2']) if p.get_text().strip()]
+        
+        # Filter out boilerplate
+        clean_paragraphs = []
+        for p in paragraphs:
+            if "Position:" in p: continue
+            if "disclosure" in p.lower(): continue
+            clean_paragraphs.append(p)
+            
+        full_text = "\n\n".join(clean_paragraphs)
+        
+        title = soup.title.string.strip() if soup.title else "No Title"
+        return full_text, title
+
     except Exception as e:
-        return None, {"error": str(e)}
+        return None, str(e)
 
-# --- 5. MAIN ---
+# --- 4. MAIN ---
 
-def get_transcript_data(ticker):
-    try:
-        candidates = find_transcript_candidates(ticker)
-        if not candidates: return None, {"error": "No Investing.com transcripts found"}
-
-        for _, url, source in candidates:
-            logger.info(f"Fetching: {url}")
-            text, meta = fetch_page(url, source, ticker)
-            if text: return text, meta
-                
-        return None, {"error": "Candidates found but parsing failed"}
-    except Exception as e:
-        logger.error(f"Scraper Exception: {e}")
-        return None, {"error": str(e)}
+if __name__ == "__main__":
+    # Name is better than ticker for transcript searching
+    COMPANY = "Vestas Wind Systems" 
+    
+    print(f"--- 🔎 Searching for {COMPANY} Transcripts ---")
+    
+    # 1. Search
+    query = f"{COMPANY} earnings call transcript"
+    raw_links = search_bing_broad(query)
+    valid_links = filter_investing_links(raw_links)
+    
+    if not valid_links:
+        print("❌ No Investing.com links found. (Search engine might be blocking or empty)")
+        sys.exit(1)
+        
+    print(f"✅ Found {len(valid_links)} potential links.")
+    
+    # 2. Sort by Date (Best guess from URL)
+    valid_links.sort(key=parse_quarter_score, reverse=True)
+    target_url = valid_links[0]
+    
+    print(f"🎯 Target URL: {target_url}")
+    
+    # 3. Fetch
+    text, title = fetch_transcript_text(target_url)
+    
+    if text:
+        print("\n" + "="*60)
+        print(f"TITLE: {title}")
+        print("="*60 + "\n")
+        print(text[:1500] + "...\n")
+        print("="*60)
+        
+        # Save
+        with open("vestas_transcript.txt", "w", encoding="utf-8") as f:
+            f.write(f"URL: {target_url}\n\n{text}")
+        print("✅ Transcript saved to 'vestas_transcript.txt'")
+    else:
+        print(f"❌ Failed to parse content: {title}")
