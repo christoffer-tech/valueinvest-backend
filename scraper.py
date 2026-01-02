@@ -6,17 +6,18 @@ import time
 import random
 from bs4 import BeautifulSoup
 
-# --- 1. SETUP ---
+# --- 1. CONFIGURATION & LOGGING ---
 logger = logging.getLogger("Scraper")
 handler = logging.StreamHandler(sys.stderr)
 handler.setFormatter(logging.Formatter('[SCRAPER] %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# Try to use curl_cffi for better TLS fingerprinting
 try:
     from curl_cffi import requests as cffi_requests
     SESSION_TYPE = "cffi"
-    logger.info("✅ curl_cffi loaded (Best for bypassing Cloudflare)")
+    logger.info("✅ curl_cffi loaded.")
 except ImportError:
     import requests as std_requests
     SESSION_TYPE = "standard"
@@ -26,55 +27,45 @@ except ImportError:
 
 def get_session(mobile=False):
     """
-    Creates a new session with rotated headers to evade IP blocks.
+    Creates a session with realistic browser headers.
     """
     if mobile:
-        ua = f"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(110, 120)}.0.0.0 Mobile Safari/537.36"
+        ua = f"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(120, 130)}.0.0.0 Mobile Safari/537.36"
     else:
-        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(110, 120)}.0.0.0 Safari/537.36"
+        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(120, 130)}.0.0.0 Safari/537.36"
 
     headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/"
+        "Referer": "https://www.google.com/",
+        "Upgrade-Insecure-Requests": "1"
     }
 
     if SESSION_TYPE == "cffi":
-        return cffi_requests.Session(impersonate="chrome120", headers=headers)
+        # Randomize impersonation to look less robotic
+        ver = random.choice(["chrome110", "chrome120", "chrome124"])
+        return cffi_requests.Session(impersonate=ver, headers=headers)
     else:
         s = std_requests.Session()
         s.headers.update(headers)
         return s
 
 def resolve_name(ticker):
-    """
-    Smart name resolver. 
-    1. Removes suffixes (.CO, .DE).
-    2. Maps known difficult tickers.
-    3. Returns clean name.
-    """
-    clean_ticker = ticker.upper().split('.')[0]
-    
-    # Map for known difficult tickers
+    """Resolves ticker to company name."""
+    t = ticker.upper().split('.')[0]
     mapping = {
         "VWS": "Vestas Wind Systems",
         "VWDRY": "Vestas Wind Systems",
         "PNDORA": "Pandora A/S",
         "TSLA": "Tesla",
-        "AAPL": "Apple",
-        "MSFT": "Microsoft",
-        "NVDA": "Nvidia",
-        "GOOG": "Alphabet",
-        "META": "Meta Platforms"
+        "NVDA": "Nvidia"
     }
-    
-    return mapping.get(clean_ticker, clean_ticker)
+    return mapping.get(t, t)
 
-# --- 3. MULTI-ENGINE SEARCH ORCHESTRATOR ---
+# --- 3. SEARCH ENGINES ---
 
 def search_duckduckgo(query):
-    """Engine 1: DuckDuckGo Lite (HTML)"""
     try:
         url = "https://html.duckduckgo.com/html/"
         data = {'q': query + " site:investing.com earnings call transcript"}
@@ -89,24 +80,7 @@ def search_duckduckgo(query):
         return links
     except: return []
 
-def search_brave(query):
-    """Engine 2: Brave Search (Cloud Friendly)"""
-    try:
-        url = "https://search.brave.com/search"
-        params = {'q': query + " site:investing.com earnings call transcript", 'source': 'web'}
-        sess = get_session()
-        resp = sess.get(url, params=params, timeout=10)
-        if resp.status_code != 200: return []
-        
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        links = []
-        for a in soup.find_all('a', href=True):
-            if "investing.com" in a['href']: links.append(a['href'])
-        return links
-    except: return []
-
 def search_yahoo(query):
-    """Engine 3: Yahoo Search (Backup)"""
     try:
         url = "https://search.yahoo.com/search"
         params = {'p': query + " site:investing.com earnings call transcript", 'ei': 'UTF-8'}
@@ -118,8 +92,7 @@ def search_yahoo(query):
         links = []
         for a in soup.find_all('a', href=True):
             href = a['href']
-            # Decode Yahoo Redirects
-            if "RU=" in href:
+            if "RU=" in href: # Decode Yahoo Redirects
                 try:
                     start = href.find("RU=") + 3
                     end = href.find("/RK=")
@@ -131,27 +104,17 @@ def search_yahoo(query):
     except: return []
 
 def get_candidates(ticker):
-    """
-    Rotates through search engines until links are found.
-    """
     name = resolve_name(ticker)
     logger.info(f"🔎 Searching for: {name} (Ticker: {ticker})")
     
-    # 1. Try DuckDuckGo
+    # 1. DuckDuckGo (Primary)
     links = search_duckduckgo(name)
     if links: 
         logger.info(f"✅ DuckDuckGo found {len(links)} links")
         return filter_links(links)
         
-    # 2. Try Brave
-    logger.info("⚠️ DDG failed. Switching to Brave...")
-    links = search_brave(name)
-    if links:
-        logger.info(f"✅ Brave found {len(links)} links")
-        return filter_links(links)
-
-    # 3. Try Yahoo
-    logger.info("⚠️ Brave failed. Switching to Yahoo...")
+    # 2. Yahoo (Backup)
+    logger.info("⚠️ DDG failed. Switching to Yahoo...")
     links = search_yahoo(name)
     if links:
         logger.info(f"✅ Yahoo found {len(links)} links")
@@ -160,57 +123,97 @@ def get_candidates(ticker):
     return []
 
 def filter_links(raw_links):
-    """Strictly ensures links are transcripts."""
     valid = []
     seen = set()
     for l in raw_links:
         if l in seen: continue
         seen.add(l)
-        
         if "investing.com" in l and ("/news/" in l or "/equities/" in l):
             if "transcript" in l.lower() or "earnings" in l.lower():
                 valid.append(l)
     return valid
 
-# --- 4. FETCHING (Google Translate Proxy) ---
+# --- 4. FETCHING STRATEGIES ---
 
 def clean_text(soup):
-    # Locate content container
+    """
+    Robust text cleaner.
+    Falls back to collecting ALL paragraphs if specific containers are missing.
+    """
+    # 1. Try standard containers
     body = soup.find('div', class_='WYSIWYG') or \
            soup.find('div', class_='articlePage') or \
            soup.find('div', id='article-content') or \
            soup.find('div', class_='article-content')
 
+    # 2. If no container (common in Cache/Proxy), use Body
+    if not body:
+        body = soup.body
+
     if not body: return None
 
     # Remove junk
-    for tag in body(["script", "style", "iframe", "aside", "button", "figure", "span"]): 
-        if tag.name == "span" and "img" in str(tag): tag.decompose()
-        elif tag.name != "span": tag.decompose()
+    for tag in body(["script", "style", "iframe", "aside", "button", "figure", "span", "nav", "footer", "header"]): 
+        tag.decompose()
     
     for div in body.find_all('div'):
         if any(cls in str(div.get('class', [])) for cls in ['related', 'carousel', 'promo', 'ad', 'img', 'share']):
             div.decompose()
 
-    # Extract clean paragraphs
+    # Extract text
     text_parts = []
-    for p in body.find_all(['p', 'h2']):
+    for p in body.find_all(['p', 'h2', 'div']): # div included for unformatted text
         txt = p.get_text().strip()
-        if len(txt) > 30 and "Position:" not in txt and "confidential tip" not in txt:
+        # Quality filter
+        if len(txt) > 40 and "Position:" not in txt and "confidential tip" not in txt and "Copyright" not in txt:
             text_parts.append(txt)
+    
+    # Heuristic: If we found very few paragraphs, it's probably a failed parse
+    if len(text_parts) < 5: return None
             
     return "\n\n".join(text_parts)
 
-def fetch_via_google_translate(url):
+def fetch_google_cache(url):
     """
-    Proxies the request through Google Translate to bypass 403 blocks.
+    STRATEGY 1: Google Web Cache (Text Only).
+    This is the most powerful unblocking method.
     """
     try:
-        # Translate English -> English
-        proxy_url = f"https://translate.google.com/translate?sl=en&tl=en&u={urllib.parse.quote(url)}"
-        logger.info(f"🛡️ Proxy Fetch: {url}")
+        # 'strip=1' forces text-only mode (extremely fast, no JS)
+        cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{urllib.parse.quote(url)}&strip=1&vwsrc=0"
+        logger.info(f"🛡️ Google Cache: {cache_url}")
         
-        sess = get_session(mobile=False)
+        sess = get_session()
+        resp = sess.get(cache_url, timeout=15)
+        
+        if resp.status_code == 404:
+            logger.warning("   ↳ Cache miss (404).")
+            return None
+        if resp.status_code != 200: 
+            return None
+            
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        # Google Cache often puts content in a <pre> tag or raw body
+        text = clean_text(soup)
+        if not text:
+            # Fallback: Just grab the whole text if structure is gone
+            text = soup.get_text()
+            
+        return text
+    except Exception as e:
+        logger.error(f"Cache Error: {e}")
+        return None
+
+def fetch_via_google_translate(url):
+    """
+    STRATEGY 2: Google Translate Proxy.
+    """
+    try:
+        proxy_url = f"https://translate.google.com/translate?sl=en&tl=en&u={urllib.parse.quote(url)}"
+        logger.info(f"🛡️ Translate Proxy: {proxy_url}")
+        
+        sess = get_session()
         resp = sess.get(proxy_url, timeout=20)
         
         if resp.status_code != 200: return None
@@ -218,62 +221,43 @@ def fetch_via_google_translate(url):
         soup = BeautifulSoup(resp.content, 'html.parser')
         text = clean_text(soup)
         
-        # If proxy wrapper hides content in iframe
         if not text or len(text) < 500:
             iframe = soup.find('iframe', {'name': 'c'})
             if iframe and iframe.get('src'):
-                logger.info("   ↳ Following Proxy Iframe...")
+                logger.info("   ↳ Following Iframe...")
                 resp2 = sess.get(iframe['src'], timeout=15)
                 text = clean_text(BeautifulSoup(resp2.content, 'html.parser'))
 
         return text
     except Exception as e:
-        logger.error(f"Proxy Error: {e}")
         return None
-
-def fetch_direct(url):
-    """Direct fetch attempt (low success rate on cloud, but fast)."""
-    try:
-        sess = get_session(mobile=False)
-        resp = sess.get(url, timeout=10)
-        if resp.status_code != 200: return None
-        return clean_text(BeautifulSoup(resp.content, 'html.parser'))
-    except: return None
 
 # --- 5. MAIN ---
 
 def get_transcript_data(ticker):
     logger.info(f"🚀 STARTING SCRAPE FOR: {ticker}")
     
-    # 1. Find Candidates (Multi-Engine)
+    # 1. Search
     candidates = get_candidates(ticker)
-    
     if not candidates:
-        logger.error("❌ No links found on any search engine.")
-        return None, {"error": "Search failed on DDG, Brave, and Yahoo."}
+        return None, {"error": "No links found via Search."}
     
-    # 2. Fetch Content (Try top 3)
+    # 2. Fetch Loop
     for link in candidates[:3]:
+        logger.info(f"🔗 Target: {link}")
         
-        # A. Try Proxy (Most Reliable)
-        text = fetch_via_google_translate(link)
-        
-        # B. Try Direct (Fallback)
-        if not text:
-            text = fetch_direct(link)
-            
+        # A. Try Google Cache (Best)
+        text = fetch_google_cache(link)
         if text and len(text) > 1000:
-            logger.info("✅ Transcript Scraped Successfully")
-            return text, {
-                "source": "Investing.com",
-                "url": link,
-                "title": "Earnings Call Transcript",
-                "symbol": ticker
-            }
+            return text, {"source": "Investing.com (Cache)", "url": link, "title": "Earnings Call", "symbol": ticker}
+            
+        # B. Try Translate Proxy (Backup)
+        text = fetch_via_google_translate(link)
+        if text and len(text) > 1000:
+            return text, {"source": "Investing.com (Proxy)", "url": link, "title": "Earnings Call", "symbol": ticker}
             
     return None, {"error": "Found links but failed to fetch content (Blocked)."}
 
 if __name__ == "__main__":
-    # Test
     t, m = get_transcript_data("VWS.CO")
     if t: print(f"SUCCESS! Length: {len(t)}")
