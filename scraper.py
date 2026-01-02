@@ -3,6 +3,7 @@ import logging
 import urllib.parse
 import re
 import random
+import json
 import requests as std_requests
 from bs4 import BeautifulSoup
 
@@ -15,23 +16,19 @@ handler.setFormatter(logging.Formatter('[SCRAPER] %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Try curl_cffi for Direct Fetch (Fallback)
+# Try curl_cffi for Direct Fetch & Bing Search
 try:
     from curl_cffi import requests as cffi_requests
     SESSION_TYPE = "cffi"
     logger.info("✅ curl_cffi loaded.")
 except ImportError:
     SESSION_TYPE = "standard"
-    logger.warning("⚠️ curl_cffi not found.")
+    logger.warning("⚠️ curl_cffi not found. Bing strategy will be weaker.")
 
 # --- 2. SESSION FACTORY ---
 
-def get_session():
-    """Standard session for Jina interactions"""
-    return std_requests.Session()
-
 def get_cffi_session():
-    """Browser session for Direct Fetch / Cache"""
+    """Browser session for Direct Fetch / Search"""
     ver = random.choice(["120", "124", "119"])
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
     
@@ -60,61 +57,121 @@ def resolve_name(ticker):
     }
     return mapping.get(t, t)
 
-# --- 3. JINA SEARCH IMPLEMENTATION ---
+# --- 3. SEARCH STRATEGIES ---
 
 def search_jina(query):
-    """
-    Uses Jina's Search Endpoint (s.jina.ai) to find URLs.
-    This bypasses Google/DDG blocks on cloud IPs.
-    """
+    """Strategy A: Jina Search (s.jina.ai) - Increased Timeout"""
     try:
-        logger.info("   🔍 Strategy: Jina Search (s.jina.ai)...")
-        
-        # We construct a specific query to target Investing.com transcripts
+        logger.info("   🔍 Strategy A: Jina Search...")
         search_query = f"{query} site:investing.com earnings call transcript"
         jina_search_url = f"https://s.jina.ai/{urllib.parse.quote(search_query)}"
         
-        headers = {
-            "Authorization": f"Bearer {JINA_API_KEY}",
-            "X-Retain-Images": "none"
-        }
+        headers = {"Authorization": f"Bearer {JINA_API_KEY}", "X-Retain-Images": "none"}
         
-        # Jina Search returns a Markdown summary of search results
-        resp = std_requests.get(jina_search_url, headers=headers, timeout=20)
+        # INCREASED TIMEOUT to 60s
+        resp = std_requests.get(jina_search_url, headers=headers, timeout=60)
         
         if resp.status_code != 200:
             logger.warning(f"      ↳ Jina Search Failed: {resp.status_code}")
             return []
             
-        text = resp.text
-        
-        # Extract URLs using Regex
-        # We look for links that match investing.com structure
-        # Pattern looks for: (https://www.investing.com/news/transcripts/...)
-        urls = re.findall(r'\((https://www\.investing\.com/news/transcripts/[^\)]+)\)', text)
-        
-        # Clean and deduplicate
-        clean_urls = list(set(urls))
-        return clean_urls
-
+        urls = re.findall(r'\((https://www\.investing\.com/news/transcripts/[^\)]+)\)', resp.text)
+        return list(set(urls))
     except Exception as e:
-        logger.error(f"      ↳ Jina Search Error: {e}")
+        logger.warning(f"      ↳ Jina Error: {e}")
+        return []
+
+def search_archive_cdx(query, ticker):
+    """
+    Strategy B: Archive.org CDX Index.
+    This bypasses search engines by querying the Wayback Machine's index of investing.com directly.
+    """
+    try:
+        logger.info("   🔍 Strategy B: Archive.org CDX Index...")
+        # Query for all transcript URLs under investing.com
+        cdx_url = "https://web.archive.org/cdx/search/cdx"
+        params = {
+            "url": "investing.com/news/transcripts/*",
+            "output": "json",
+            "collapse": "urlkey",
+            "limit": "3000",  # Get last 3000 transcripts indexed
+            "fl": "original"  # Field: original url
+        }
+        
+        resp = std_requests.get(cdx_url, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json() # Returns list of lists: [["original"], ["http..."], ...]
+            
+            candidates = []
+            # Normalize query parts (e.g., "Vestas" -> "vestas")
+            q_parts = query.lower().split()
+            ticker_clean = ticker.split('.')[0].lower()
+            
+            for row in data:
+                url = row[0]
+                url_lower = url.lower()
+                
+                # Check if URL matches the company
+                if ticker_clean in url_lower or any(q in url_lower for q in q_parts):
+                    candidates.append(url)
+            
+            logger.info(f"      ↳ CDX found {len(candidates)} matches.")
+            return candidates
+    except Exception as e:
+        logger.warning(f"      ↳ CDX Error: {e}")
+        return []
+    return []
+
+def search_bing(query):
+    """Strategy C: Bing HTML Search (via curl_cffi)"""
+    try:
+        logger.info("   🔍 Strategy C: Bing Search...")
+        url = "https://www.bing.com/search"
+        params = {'q': query + " site:investing.com earnings call transcript"}
+        
+        sess = get_cffi_session()
+        resp = sess.get(url, params=params, timeout=10)
+        
+        if resp.status_code != 200: return []
+        
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        links = []
+        # Bing organic results often in <h2><a> or <div class="b_algo"><h2><a>
+        for h2 in soup.find_all('h2'):
+            a = h2.find('a', href=True)
+            if a:
+                l = a['href']
+                if "investing.com" in l and "transcript" in l.lower():
+                    links.append(l)
+        return list(set(links))
+    except Exception as e:
+        logger.warning(f"      ↳ Bing Error: {e}")
         return []
 
 def get_candidates(ticker):
     name = resolve_name(ticker)
     logger.info(f"🔎 Searching for: {name}")
     
-    # Use Jina Search
+    # 1. Try Jina
     candidates = search_jina(name)
     
+    # 2. Try Archive CDX (Very reliable fallback)
     if not candidates:
-        logger.warning("   ⚠️ No candidates found via Jina Search.")
-        return []
-
-    logger.info(f"✅ Found {len(candidates)} candidates.")
-    if candidates: logger.info(f"   🌟 Top Pick: {candidates[0]}")
+        candidates = search_archive_cdx(name, ticker)
+        
+    # 3. Try Bing
+    if not candidates:
+        candidates = search_bing(name)
     
+    # Sort by recency (Year/Quarter in URL)
+    candidates.sort(key=lambda x: x if "2025" in x else "0", reverse=True)
+    
+    if candidates: 
+        logger.info(f"✅ Found {len(candidates)} candidates.")
+        logger.info(f"   🌟 Top Pick: {candidates[0]}")
+    else:
+        logger.warning("❌ No candidates found.")
+        
     return candidates
 
 # --- 4. TEXT CLEANING & VALIDATION ---
@@ -126,8 +183,7 @@ def is_valid_content(text):
         "down for maintenance", 
         "Error 503", 
         "Access to this page has been denied", 
-        "Pardon Our Interruption",
-        "Just a moment..."
+        "Pardon Our Interruption"
     ]
     if any(flag in text for flag in error_flags): return False
     return True
@@ -156,20 +212,11 @@ def fetch_jina_proxy(url):
                 logger.warning("      ↳ Jina Blocked/Maintenance.")
                 return None
             
-            # Post-processing to strip headers/footers
-            start_markers = ["**Full transcript -", "Earnings call transcript:", "Participants", "Operator"]
-            for m in start_markers:
-                if m in text: 
-                    text = text[text.find(m):]
-                    break
-            
-            # Cut off footer
-            end_markers = ["Risk Disclosure:", "Fusion Media", "Comments"]
-            for m in end_markers:
-                if m in text:
-                    text = text[:text.find(m)]
-                    break
-                    
+            # Post-processing
+            for m in ["**Full transcript -", "Earnings call transcript:", "Participants"]:
+                if m in text: text = text[text.find(m):]; break
+            for m in ["Risk Disclosure:", "Fusion Media"]:
+                if m in text: text = text[:text.find(m)]; break
             return text.strip()
     except: pass
     return None
@@ -204,20 +251,18 @@ def get_transcript_data(ticker):
     candidates = get_candidates(ticker)
     
     if not candidates:
-        return None, {"error": "No candidates found (Search Blocked)"}
+        return None, {"error": "No candidates found (All Search Methods Failed)"}
     
-    for link in candidates:
+    # Try top 3 candidates
+    for link in candidates[:3]:
         logger.info(f"🔗 Target: {link}")
         
-        # 1. Jina Reader
         text = fetch_jina_proxy(link)
         if text: return text, {"source": "Investing.com (Jina)", "url": link}
         
-        # 2. Google Cache
         text = fetch_google_cache(link)
         if text: return text, {"source": "Investing.com (Cache)", "url": link}
         
-        # 3. Direct Fetch
         text = fetch_direct(link)
         if text: return text, {"source": "Investing.com (Direct)", "url": link}
 
