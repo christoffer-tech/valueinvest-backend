@@ -4,7 +4,7 @@ import urllib.parse
 import re
 import time
 import random
-import requests as std_requests # Standard requests for Jina/Archive
+import requests as std_requests
 from bs4 import BeautifulSoup
 
 # --- 1. CONFIGURATION ---
@@ -60,13 +60,42 @@ def resolve_name(ticker):
     }
     return mapping.get(t, t)
 
-# --- 3. SEARCH (DuckDuckGo Lite) ---
+# --- 3. SEARCH & RANKING (The Fix for Old Transcripts) ---
+
+def parse_quarter_score(text):
+    """
+    Scores a URL based on recency.
+    Higher Score = Newer Transcript.
+    Example: 'Q3 2025' -> 20253
+    """
+    if not text: return 0
+    text = text.upper()
+    
+    # Extract Year (Default to 2024 if missing, but usually present in URL)
+    year_match = re.search(r'20(\d{2})', text)
+    year = int("20" + year_match.group(1)) if year_match else 2024
+    
+    # Extract Quarter
+    q_map = {
+        "Q1": 1, "1Q": 1, "FIRST": 1,
+        "Q2": 2, "2Q": 2, "SECOND": 2, "HALF": 2,
+        "Q3": 3, "3Q": 3, "THIRD": 3,
+        "Q4": 4, "4Q": 4, "FOURTH": 4, "FY": 4
+    }
+    quarter = 0
+    for k, v in q_map.items():
+        if k in text:
+            quarter = v
+            break
+            
+    # Score = Year * 10 + Quarter (e.g., 2025 Q3 = 20253)
+    return (year * 10) + quarter
 
 def search_duckduckgo(query):
     try:
         url = "https://html.duckduckgo.com/html/"
+        # We explicitly search for "earnings call transcript" to filter noise
         data = {'q': query + " site:investing.com earnings call transcript"}
-        # Use cffi for search to avoid blocks
         sess = get_cffi_session() 
         resp = sess.post(url, data=data, timeout=10)
         
@@ -83,18 +112,31 @@ def get_candidates(ticker):
     name = resolve_name(ticker)
     logger.info(f"🔎 Searching for: {name}")
     
-    links = search_duckduckgo(name)
-    valid = []
+    raw_links = search_duckduckgo(name)
+    candidates = []
     seen = set()
-    for l in links:
+    
+    for l in raw_links:
         if l in seen: continue
         seen.add(l)
+        
+        # Strict Filter: Must be investing.com and look like a transcript
         if "investing.com" in l and ("/news/" in l or "/equities/" in l):
             if "transcript" in l.lower() or "earnings" in l.lower():
-                valid.append(l)
+                # Score the link based on Q3/Q2/Year
+                score = parse_quarter_score(l)
+                candidates.append({'url': l, 'score': score})
     
-    logger.info(f"✅ Found {len(valid)} candidates.")
-    return valid
+    # Sort by Score Descending (Highest/Newest first)
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    sorted_urls = [x['url'] for x in candidates]
+    logger.info(f"✅ Found {len(sorted_urls)} candidates (Sorted by Recency).")
+    
+    if sorted_urls:
+        logger.info(f"   🌟 Top Pick: {sorted_urls[0]}")
+        
+    return sorted_urls
 
 # --- 4. TEXT CLEANER ---
 
@@ -119,9 +161,7 @@ def clean_text(soup):
 # --- 5. FETCHING STRATEGIES ---
 
 def fetch_jina_proxy(url):
-    """
-    STRATEGY 1: Jina Reader API (Authenticated & Cleaned)
-    """
+    """STRATEGY 1: Jina Reader API (Authenticated & Cleaned)"""
     try:
         logger.info(f"   🤖 Trying Jina Reader...")
         jina_url = f"https://r.jina.ai/{url}"
@@ -152,20 +192,18 @@ def fetch_jina_proxy(url):
                     break
             
             if start_idx != -1:
-                text = text[start_idx:] # Slice off the top menu noise
+                text = text[start_idx:] 
             
             # 2. Find End (Skip footer/disclaimers)
             end_markers = ["Risk Disclosure:", "Fusion Media", "Comments", "Terms And Conditions"]
             for marker in end_markers:
                 idx = text.find(marker)
                 if idx != -1:
-                    text = text[:idx] # Slice off the footer
+                    text = text[:idx]
                     break
             
             logger.info("      ↳ Jina Success! (Cleaned)")
             return text.strip()
-        else:
-            logger.warning(f"      ↳ Jina Status: {resp.status_code}")
         return None
     except Exception as e: return None
 
@@ -186,8 +224,6 @@ def fetch_google_cache(url):
             if text and len(text) > 500: return text
         elif resp.status_code == 404:
             logger.info("      ↳ Cache Miss")
-        else:
-            logger.info(f"      ↳ Cache Failed ({resp.status_code})")
         return None
     except: return None
 
@@ -202,13 +238,12 @@ def fetch_archive(url):
             data = resp.json()
             if data.get('archived_snapshots', {}).get('closest', {}):
                 snap_url = data['archived_snapshots']['closest']['url']
-                logger.info(f"      ↳ Found Wayback: {snap_url}")
                 resp_snap = std_requests.get(snap_url, timeout=20)
                 if resp_snap.status_code == 200:
                     text = clean_text(BeautifulSoup(resp_snap.content, 'html.parser'))
                     if text and len(text) > 500: return text
         
-        # 2. Archive.today (Requires curl_cffi usually)
+        # 2. Archive.today
         if SESSION_TYPE == "cffi":
             sess = get_cffi_session()
             archive_url = f"https://archive.today/newest/{url}"
@@ -216,30 +251,11 @@ def fetch_archive(url):
             if resp.status_code == 200:
                 text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
                 if text and len(text) > 500: return text
-                
-        return None
-    except: return None
-
-def fetch_translate(url):
-    """STRATEGY 4: Google Translate Proxy"""
-    try:
-        logger.info(f"   🛡️ Trying Translate Proxy...")
-        proxy_url = f"https://translate.google.com/translate?sl=en&tl=en&u={urllib.parse.quote(url)}"
-        sess = get_cffi_session()
-        resp = sess.get(proxy_url, timeout=20)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            iframe = soup.find('iframe', {'name': 'c'})
-            if iframe and iframe.get('src'):
-                resp = sess.get(iframe['src'], timeout=15)
-                soup = BeautifulSoup(resp.content, 'html.parser')
-            text = clean_text(soup)
-            if text and len(text) > 500: return text
         return None
     except: return None
 
 def fetch_direct(url):
-    """STRATEGY 5: Direct Fetch"""
+    """STRATEGY 4: Direct Fetch"""
     try:
         logger.info(f"   ⚡ Trying Direct Fetch...")
         sess = get_cffi_session()
@@ -255,7 +271,7 @@ def fetch_direct(url):
 def get_transcript_data(ticker):
     logger.info(f"🚀 STARTING SCRAPE FOR: {ticker}")
     
-    # 1. Search
+    # 1. Search & Rank
     candidates = get_candidates(ticker)
     if not candidates:
         return None, {"error": "No candidates found."}
@@ -264,7 +280,7 @@ def get_transcript_data(ticker):
     for link in candidates[:3]:
         logger.info(f"🔗 Target: {link}")
         
-        # Priority 1: Jina (Best for cleaning & bypass)
+        # Priority 1: Jina
         text = fetch_jina_proxy(link)
         if text: return text, {"source": "Investing.com (Jina)", "url": link, "title": "Earnings Call", "symbol": ticker}
 
@@ -276,17 +292,12 @@ def get_transcript_data(ticker):
         text = fetch_archive(link)
         if text: return text, {"source": "Investing.com (Archive)", "url": link, "title": "Earnings Call", "symbol": ticker}
 
-        # Priority 4: Translate Proxy
-        text = fetch_translate(link)
-        if text: return text, {"source": "Investing.com (Translate)", "url": link, "title": "Earnings Call", "symbol": ticker}
-        
-        # Priority 5: Direct
+        # Priority 4: Direct
         text = fetch_direct(link)
         if text: return text, {"source": "Investing.com (Direct)", "url": link, "title": "Earnings Call", "symbol": ticker}
 
     return None, {"error": "All fetch methods failed."}
 
 if __name__ == "__main__":
-    # Test
     t, m = get_transcript_data("VWS.CO")
     if t: print(f"SUCCESS: {len(t)} chars")
