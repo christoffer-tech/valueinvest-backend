@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. SEARCH LOGIC (FIXED) ---
+# --- 2. SEARCH LOGIC ---
 
 def search_bing_broad(query):
     """
@@ -69,9 +69,6 @@ def filter_investing_links(raw_links):
         if "investing.com" not in l: continue
 
         # 2. MUST be a transcript or news article
-        # Valid patterns:
-        # - /news/transcripts/earnings-call-transcript...
-        # - /equities/vestas...earnings-calls-transcripts
         if "/news/" in l or "/equities/" in l:
             if "transcript" in l or "earnings-call" in l:
                 valid.append(link)
@@ -81,11 +78,9 @@ def filter_investing_links(raw_links):
 def parse_quarter_score(url):
     """Scores URLs based on recency (Year/Quarter) found in the slug."""
     # Heuristic: Higher score = Newer
-    # Extract year
     year_match = re.search(r'20(\d{2})', url)
     year = int("20" + year_match.group(1)) if year_match else 2020
     
-    # Extract quarter
     q_map = {"q1": 1, "q2": 2, "q3": 3, "q4": 4}
     q = 0
     for k, v in q_map.items():
@@ -115,7 +110,6 @@ def fetch_transcript_text(url):
         soup = BeautifulSoup(resp.content, 'html.parser')
         
         # 1. Locate Content
-        # Investing.com article body is usually in 'WYSIWYG' or 'articlePage' class
         body = soup.find('div', class_='WYSIWYG') or soup.find('div', class_='articlePage')
         
         if not body:
@@ -125,7 +119,6 @@ def fetch_transcript_text(url):
         for tag in body(["script", "style", "iframe"]):
             tag.decompose()
         
-        # Remove 'Related Articles' divs
         for div in body.find_all('div'):
             if "related" in str(div.get('class', [])) or "carousel" in str(div.get('class', [])):
                 div.decompose()
@@ -133,7 +126,6 @@ def fetch_transcript_text(url):
         # 3. Extract Text
         paragraphs = [p.get_text().strip() for p in body.find_all(['p', 'h2']) if p.get_text().strip()]
         
-        # Filter out boilerplate
         clean_paragraphs = []
         for p in paragraphs:
             if "Position:" in p: continue
@@ -141,51 +133,70 @@ def fetch_transcript_text(url):
             clean_paragraphs.append(p)
             
         full_text = "\n\n".join(clean_paragraphs)
-        
         title = soup.title.string.strip() if soup.title else "No Title"
-        return full_text, title
+        
+        # Attempt to extract date
+        date_str = "Unknown Date"
+        date_div = soup.find('div', class_='contentSectionDetails')
+        if date_div and date_div.find('span'):
+            date_str = date_div.find('span').get_text().replace("Published", "").strip()
+
+        return full_text, title, date_str
 
     except Exception as e:
-        return None, str(e)
+        return None, str(e), None
 
-# --- 4. MAIN ---
+# --- 4. MAIN WRAPPER (Restores Compatibility) ---
+
+def get_transcript_data(ticker):
+    """
+    Wrapper function to maintain backward compatibility with main.py.
+    Orchestrates the search -> filter -> sort -> fetch pipeline.
+    """
+    try:
+        logger.info(f"🔎 Orchestrating search for {ticker}...")
+        
+        # 1. Search Broadly
+        # Resolving ticker to name improves results (e.g., VWS.CO -> Vestas Wind Systems)
+        # This is a simple fallback mapping, you can expand it or use the yahoo logic if needed
+        query_name = ticker
+        if "VWS" in ticker: query_name = "Vestas Wind Systems"
+        
+        raw_links = search_bing_broad(f"{query_name} earnings call transcript")
+        valid_links = filter_investing_links(raw_links)
+        
+        if not valid_links:
+            return None, {"error": "No Investing.com links found via Bing"}
+
+        # 2. Sort by Recency
+        valid_links.sort(key=parse_quarter_score, reverse=True)
+        target_url = valid_links[0]
+        
+        # 3. Fetch Content
+        text, title, date = fetch_transcript_text(target_url)
+        
+        if not text:
+            return None, {"error": f"Failed to parse content: {title}"}
+            
+        # 4. Construct 'Meta' dictionary expected by main.py
+        meta = {
+            "source": "Investing.com",
+            "url": target_url,
+            "symbol_used": ticker,
+            "title": title,
+            "date": date
+        }
+        
+        return text, meta
+
+    except Exception as e:
+        logger.error(f"Wrapper Exception: {e}")
+        return None, {"error": str(e)}
 
 if __name__ == "__main__":
-    # Name is better than ticker for transcript searching
-    COMPANY = "Vestas Wind Systems" 
-    
-    print(f"--- 🔎 Searching for {COMPANY} Transcripts ---")
-    
-    # 1. Search
-    query = f"{COMPANY} earnings call transcript"
-    raw_links = search_bing_broad(query)
-    valid_links = filter_investing_links(raw_links)
-    
-    if not valid_links:
-        print("❌ No Investing.com links found. (Search engine might be blocking or empty)")
-        sys.exit(1)
-        
-    print(f"✅ Found {len(valid_links)} potential links.")
-    
-    # 2. Sort by Date (Best guess from URL)
-    valid_links.sort(key=parse_quarter_score, reverse=True)
-    target_url = valid_links[0]
-    
-    print(f"🎯 Target URL: {target_url}")
-    
-    # 3. Fetch
-    text, title = fetch_transcript_text(target_url)
-    
-    if text:
-        print("\n" + "="*60)
-        print(f"TITLE: {title}")
-        print("="*60 + "\n")
-        print(text[:1500] + "...\n")
-        print("="*60)
-        
-        # Save
-        with open("vestas_transcript.txt", "w", encoding="utf-8") as f:
-            f.write(f"URL: {target_url}\n\n{text}")
-        print("✅ Transcript saved to 'vestas_transcript.txt'")
+    # Test Block
+    t, m = get_transcript_data("Vestas Wind Systems")
+    if t:
+        print(f"SUCCESS: {m['title']}")
     else:
-        print(f"❌ Failed to parse content: {title}")
+        print(f"FAILURE: {m}")
