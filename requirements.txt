@@ -9,3 +9,6 @@ beautifulsoup4
 pdfplumber
 lxml
 curl-cffi
+pdf2image
+pytesseract
+Pillow
