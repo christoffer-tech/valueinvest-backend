@@ -2,7 +2,6 @@ import sys
 import logging
 import urllib.parse
 import re
-import time
 import random
 import requests as std_requests
 from bs4 import BeautifulSoup
@@ -16,32 +15,34 @@ handler.setFormatter(logging.Formatter('[SCRAPER] %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Try curl_cffi for Direct Fetch & Google Search
+# Try curl_cffi for Direct Fetch (Fallback)
 try:
     from curl_cffi import requests as cffi_requests
     SESSION_TYPE = "cffi"
-    logger.info("✅ curl_cffi loaded (Enhanced Stealth Mode).")
+    logger.info("✅ curl_cffi loaded.")
 except ImportError:
     SESSION_TYPE = "standard"
-    logger.warning("⚠️ curl_cffi not found. Google Search strategy may fail.")
+    logger.warning("⚠️ curl_cffi not found.")
 
 # --- 2. SESSION FACTORY ---
 
+def get_session():
+    """Standard session for Jina interactions"""
+    return std_requests.Session()
+
 def get_cffi_session():
-    """Browser session for Direct Fetch & Search"""
+    """Browser session for Direct Fetch / Cache"""
     ver = random.choice(["120", "124", "119"])
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
     
     headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.google.com/",
         "Upgrade-Insecure-Requests": "1"
     }
     
     if SESSION_TYPE == "cffi":
-        # impersonate="chrome120" is crucial for bypassing Google/Cloudflare blocks
         return cffi_requests.Session(impersonate="chrome120", headers=headers)
     else:
         s = std_requests.Session()
@@ -55,136 +56,84 @@ def resolve_name(ticker):
         "VWDRY": "Vestas Wind Systems",
         "PNDORA": "Pandora A/S",
         "TSLA": "Tesla",
-        "NVDA": "Nvidia",
-        "AAPL": "Apple",
-        "MSFT": "Microsoft"
+        "NVDA": "Nvidia"
     }
     return mapping.get(t, t)
 
-# --- 3. SEARCH STRATEGIES (New & Improved) ---
+# --- 3. JINA SEARCH IMPLEMENTATION ---
 
-def parse_quarter_score(text):
-    if not text: return 0
-    text = text.upper()
-    year_match = re.search(r'20(\d{2})', text)
-    year = int("20" + year_match.group(1)) if year_match else 2024
-    q_map = {"Q1": 1, "1Q": 1, "FIRST": 1, "Q2": 2, "2Q": 2, "HALF": 2, "Q3": 3, "3Q": 3, "Q4": 4, "4Q": 4, "FY": 4}
-    quarter = 0
-    for k, v in q_map.items():
-        if k in text:
-            quarter = v
-            break
-    return (year * 10) + quarter
-
-def search_google_cffi(query):
-    """Strategy A: Google Search via curl_cffi (Best for Cloud IPs)"""
+def search_jina(query):
+    """
+    Uses Jina's Search Endpoint (s.jina.ai) to find URLs.
+    This bypasses Google/DDG blocks on cloud IPs.
+    """
     try:
-        logger.info("   🔍 Strategy A: Google Search...")
-        url = "https://www.google.com/search"
-        params = {'q': query + " site:investing.com earnings call transcript"}
+        logger.info("   🔍 Strategy: Jina Search (s.jina.ai)...")
         
-        sess = get_cffi_session()
-        resp = sess.get(url, params=params, timeout=10)
+        # We construct a specific query to target Investing.com transcripts
+        search_query = f"{query} site:investing.com earnings call transcript"
+        jina_search_url = f"https://s.jina.ai/{urllib.parse.quote(search_query)}"
+        
+        headers = {
+            "Authorization": f"Bearer {JINA_API_KEY}",
+            "X-Retain-Images": "none"
+        }
+        
+        # Jina Search returns a Markdown summary of search results
+        resp = std_requests.get(jina_search_url, headers=headers, timeout=20)
         
         if resp.status_code != 200:
-            logger.warning(f"      ↳ Google Blocked/Error: {resp.status_code}")
+            logger.warning(f"      ↳ Jina Search Failed: {resp.status_code}")
             return []
+            
+        text = resp.text
+        
+        # Extract URLs using Regex
+        # We look for links that match investing.com structure
+        # Pattern looks for: (https://www.investing.com/news/transcripts/...)
+        urls = re.findall(r'\((https://www\.investing\.com/news/transcripts/[^\)]+)\)', text)
+        
+        # Clean and deduplicate
+        clean_urls = list(set(urls))
+        return clean_urls
 
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        links = []
-        
-        # Parse Google Results (Standard Structure)
-        for g in soup.find_all('div', class_='g'):
-            a = g.find('a', href=True)
-            if a and 'href' in a.attrs:
-                link = a['href']
-                if "investing.com" in link:
-                    links.append(link)
-        
-        return list(set(links))
     except Exception as e:
-        logger.error(f"      ↳ Google Search Failed: {e}")
+        logger.error(f"      ↳ Jina Search Error: {e}")
         return []
-
-def search_ddg_lite(query):
-    """Strategy B: DuckDuckGo Lite (HTML version, less strict)"""
-    try:
-        logger.info("   🔍 Strategy B: DuckDuckGo Lite...")
-        url = "https://lite.duckduckgo.com/lite/"
-        data = {'q': query + " site:investing.com earnings call transcript"}
-        sess = get_cffi_session()
-        resp = sess.post(url, data=data, timeout=10)
-        
-        if resp.status_code != 200: return []
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        
-        links = []
-        for a in soup.find_all('a', class_='result-link', href=True):
-            links.append(a['href'])
-        return links
-    except: return []
-
-def search_ddg_html(query):
-    """Strategy C: DuckDuckGo HTML (Original, strict on Cloud IPs)"""
-    try:
-        logger.info("   🔍 Strategy C: DuckDuckGo Standard...")
-        url = "https://html.duckduckgo.com/html/"
-        data = {'q': query + " site:investing.com earnings call transcript"}
-        sess = get_cffi_session() 
-        resp = sess.post(url, data=data, timeout=10)
-        
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        links = []
-        for a in soup.find_all('a', class_='result__a', href=True):
-            links.append(a['href'])
-        return links
-    except: return []
 
 def get_candidates(ticker):
     name = resolve_name(ticker)
     logger.info(f"🔎 Searching for: {name}")
     
-    # 1. Try Google First (Most Robust with curl_cffi)
-    raw_links = search_google_cffi(name)
+    # Use Jina Search
+    candidates = search_jina(name)
     
-    # 2. Fallback to DDG Lite if Google fails
-    if not raw_links:
-        raw_links = search_ddg_lite(name)
-        
-    # 3. Last resort: DDG Standard
-    if not raw_links:
-        raw_links = search_ddg_html(name)
+    if not candidates:
+        logger.warning("   ⚠️ No candidates found via Jina Search.")
+        return []
 
-    # Filter & Score
-    candidates = []
-    seen = set()
-    for l in raw_links:
-        if l in seen: continue
-        seen.add(l)
-        if "investing.com" in l and ("/news/" in l or "/equities/" in l):
-            if "transcript" in l.lower() or "earnings" in l.lower():
-                score = parse_quarter_score(l)
-                candidates.append({'url': l, 'score': score})
+    logger.info(f"✅ Found {len(candidates)} candidates.")
+    if candidates: logger.info(f"   🌟 Top Pick: {candidates[0]}")
     
-    candidates.sort(key=lambda x: x['score'], reverse=True)
-    sorted_urls = [x['url'] for x in candidates]
-    
-    logger.info(f"✅ Found {len(sorted_urls)} candidates.")
-    if sorted_urls: logger.info(f"   🌟 Top Pick: {sorted_urls[0]}")
-    
-    return sorted_urls
+    return candidates
 
-# --- 4. VALIDATION & CLEANING (FIXED) ---
+# --- 4. TEXT CLEANING & VALIDATION ---
 
 def is_valid_content(text):
-    """Checks if text is a valid transcript, rejecting Maintenance/Errors."""
     if not text or len(text) < 500: return False
-    error_flags = ["Service Unavailable", "down for maintenance", "Error 503", "Access to this page has been denied", "Pardon Our Interruption", "Just a moment...", "Enable JavaScript"]
+    error_flags = [
+        "Service Unavailable", 
+        "down for maintenance", 
+        "Error 503", 
+        "Access to this page has been denied", 
+        "Pardon Our Interruption",
+        "Just a moment..."
+    ]
     if any(flag in text for flag in error_flags): return False
     return True
 
 def clean_text(soup):
-    body = soup.find('div', class_='WYSIWYG') or soup.find('div', class_='articlePage') or soup.find('div', id='article-content') or soup.body
+    body = soup.find('div', class_='WYSIWYG') or soup.find('div', class_='articlePage') or soup.body
     if not body: return None
     for tag in body(["script", "style", "iframe", "button", "figure", "aside", "nav", "footer"]): tag.decompose()
     for div in body.find_all('div'):
@@ -200,24 +149,30 @@ def fetch_jina_proxy(url):
         jina_url = f"https://r.jina.ai/{url}"
         headers = {"Authorization": f"Bearer {JINA_API_KEY}", "X-Respond-With": "markdown", "X-No-Cache": "true"}
         resp = std_requests.get(jina_url, headers=headers, timeout=40)
+        
         if resp.status_code == 200:
             text = resp.text
-            if not is_valid_content(text):
+            if not is_valid_content(text): 
                 logger.warning("      ↳ Jina Blocked/Maintenance.")
                 return None
-            start_idx = -1
-            for marker in ["**Full transcript -", "Earnings call transcript:", "Participants", "Operator"]:
-                idx = text.find(marker)
-                if idx != -1: start_idx = idx; break
-            if start_idx != -1: text = text[start_idx:]
+            
+            # Post-processing to strip headers/footers
+            start_markers = ["**Full transcript -", "Earnings call transcript:", "Participants", "Operator"]
+            for m in start_markers:
+                if m in text: 
+                    text = text[text.find(m):]
+                    break
+            
+            # Cut off footer
             end_markers = ["Risk Disclosure:", "Fusion Media", "Comments"]
-            for marker in end_markers:
-                idx = text.find(marker)
-                if idx != -1: text = text[:idx]; break
-            logger.info("      ↳ Jina Success!")
+            for m in end_markers:
+                if m in text:
+                    text = text[:text.find(m)]
+                    break
+                    
             return text.strip()
-        return None
-    except: return None
+    except: pass
+    return None
 
 def fetch_google_cache(url):
     try:
@@ -228,25 +183,8 @@ def fetch_google_cache(url):
         if resp.status_code == 200:
             text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
             if is_valid_content(text): return text
-            else: logger.info("      ↳ Cache Invalid.")
-        return None
-    except: return None
-
-def fetch_archive(url):
-    try:
-        logger.info(f"   🏛️ Trying Archive...")
-        wb_api = f"https://archive.org/wayback/available?url={url}"
-        resp = std_requests.get(wb_api, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('archived_snapshots', {}).get('closest', {}):
-                snap_url = data['archived_snapshots']['closest']['url']
-                resp_snap = std_requests.get(snap_url, timeout=20)
-                if resp_snap.status_code == 200:
-                    text = clean_text(BeautifulSoup(resp_snap.content, 'html.parser'))
-                    if is_valid_content(text): return text
-        return None
-    except: return None
+    except: pass
+    return None
 
 def fetch_direct(url):
     try:
@@ -256,9 +194,8 @@ def fetch_direct(url):
         if resp.status_code == 200:
             text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
             if is_valid_content(text): return text
-            else: logger.warning("      ↳ Direct hit Maintenance/Block.")
-        return None
-    except: return None
+    except: pass
+    return None
 
 # --- 6. MAIN ---
 
@@ -267,17 +204,20 @@ def get_transcript_data(ticker):
     candidates = get_candidates(ticker)
     
     if not candidates:
-        logger.error("❌ No candidates found via any search method.")
-        return None, {"error": "Search failed"}
+        return None, {"error": "No candidates found (Search Blocked)"}
     
-    for link in candidates[:3]:
+    for link in candidates:
         logger.info(f"🔗 Target: {link}")
+        
+        # 1. Jina Reader
         text = fetch_jina_proxy(link)
         if text: return text, {"source": "Investing.com (Jina)", "url": link}
+        
+        # 2. Google Cache
         text = fetch_google_cache(link)
         if text: return text, {"source": "Investing.com (Cache)", "url": link}
-        text = fetch_archive(link)
-        if text: return text, {"source": "Investing.com (Archive)", "url": link}
+        
+        # 3. Direct Fetch
         text = fetch_direct(link)
         if text: return text, {"source": "Investing.com (Direct)", "url": link}
 
