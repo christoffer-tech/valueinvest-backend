@@ -4,7 +4,7 @@ import urllib.parse
 import re
 import time
 import random
-import requests as std_requests # For Jina/Standard
+import requests as std_requests # Standard requests for Jina/Archive
 from bs4 import BeautifulSoup
 
 # --- 1. CONFIGURATION ---
@@ -16,19 +16,19 @@ handler.setFormatter(logging.Formatter('[SCRAPER] %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Try curl_cffi for Direct Fetch
+# Try curl_cffi for Direct Fetch fallback
 try:
     from curl_cffi import requests as cffi_requests
     SESSION_TYPE = "cffi"
     logger.info("✅ curl_cffi loaded.")
 except ImportError:
     SESSION_TYPE = "standard"
-    logger.warning("⚠️ curl_cffi not found.")
+    logger.warning("⚠️ curl_cffi not found. Using standard requests.")
 
 # --- 2. SESSION FACTORY ---
+
 def get_cffi_session():
-    """Browser session for Direct Fetch"""
-    # Rotate Chrome versions
+    """Browser session for Direct Fetch & Search"""
     ver = random.choice(["120", "124", "119"])
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
     
@@ -61,6 +61,7 @@ def resolve_name(ticker):
     return mapping.get(t, t)
 
 # --- 3. SEARCH (DuckDuckGo Lite) ---
+
 def search_duckduckgo(query):
     try:
         url = "https://html.duckduckgo.com/html/"
@@ -96,6 +97,7 @@ def get_candidates(ticker):
     return valid
 
 # --- 4. TEXT CLEANER ---
+
 def clean_text(soup):
     # Try generic containers
     body = soup.find('div', class_='WYSIWYG') or \
@@ -116,34 +118,10 @@ def clean_text(soup):
 
 # --- 5. FETCHING STRATEGIES ---
 
-def fetch_google_cache(url):
-    """STRATEGY 1: Google Web Cache (Text Only)"""
-    try:
-        logger.info(f"   💾 Trying Google Cache...")
-        # strip=1 is VITAL - it removes JS/CSS/Images which causes 99% of blocks
-        cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{urllib.parse.quote(url)}&strip=1&vwsrc=0"
-        
-        sess = get_cffi_session()
-        # Cache usually requires a simple desktop UA
-        sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
-        
-        resp = sess.get(cache_url, timeout=15)
-        
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            # In strip=1 mode, the whole body is the text usually
-            text = clean_text(soup) or soup.get_text()
-            if text and len(text) > 500: return text
-        elif resp.status_code == 404:
-            logger.info("      ↳ Cache Miss (Page too new or uncached)")
-        else:
-            logger.info(f"      ↳ Cache Failed ({resp.status_code})")
-            
-        return None
-    except Exception as e: return None
-
 def fetch_jina_proxy(url):
-    """STRATEGY 2: Jina Reader API"""
+    """
+    STRATEGY 1: Jina Reader API (Authenticated & Cleaned)
+    """
     try:
         logger.info(f"   🤖 Trying Jina Reader...")
         jina_url = f"https://r.jina.ai/{url}"
@@ -155,18 +133,63 @@ def fetch_jina_proxy(url):
             "X-With-Generated-Alt": "false"
         }
         
-        resp = std_requests.get(jina_url, headers=headers, timeout=30)
+        resp = std_requests.get(jina_url, headers=headers, timeout=40)
         
         if resp.status_code == 200:
             text = resp.text
             if "Access to this page has been denied" in text or len(text) < 200:
                 logger.warning("      ↳ Jina Blocked.")
                 return None
-            return text
+            
+            # --- POST-PROCESSING CLEANUP ---
+            # 1. Find Start (Skip menus/tickers)
+            start_markers = ["**Full transcript -", "Earnings call transcript:", "Participants", "Operator"]
+            start_idx = -1
+            for marker in start_markers:
+                idx = text.find(marker)
+                if idx != -1:
+                    start_idx = idx
+                    break
+            
+            if start_idx != -1:
+                text = text[start_idx:] # Slice off the top menu noise
+            
+            # 2. Find End (Skip footer/disclaimers)
+            end_markers = ["Risk Disclosure:", "Fusion Media", "Comments", "Terms And Conditions"]
+            for marker in end_markers:
+                idx = text.find(marker)
+                if idx != -1:
+                    text = text[:idx] # Slice off the footer
+                    break
+            
+            logger.info("      ↳ Jina Success! (Cleaned)")
+            return text.strip()
         else:
             logger.warning(f"      ↳ Jina Status: {resp.status_code}")
         return None
     except Exception as e: return None
+
+def fetch_google_cache(url):
+    """STRATEGY 2: Google Web Cache (Text Only)"""
+    try:
+        logger.info(f"   💾 Trying Google Cache...")
+        cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{urllib.parse.quote(url)}&strip=1&vwsrc=0"
+        
+        sess = get_cffi_session()
+        sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+        
+        resp = sess.get(cache_url, timeout=15)
+        
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            text = clean_text(soup) or soup.get_text()
+            if text and len(text) > 500: return text
+        elif resp.status_code == 404:
+            logger.info("      ↳ Cache Miss")
+        else:
+            logger.info(f"      ↳ Cache Failed ({resp.status_code})")
+        return None
+    except: return None
 
 def fetch_archive(url):
     """STRATEGY 3: Archive.today / Wayback"""
@@ -224,10 +247,8 @@ def fetch_direct(url):
         if resp.status_code == 200:
             text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
             if text and len(text) > 500: return text
-        else:
-            logger.info(f"      ↳ Direct Failed: {resp.status_code}")
         return None
-    except Exception as e: return None
+    except: return None
 
 # --- 6. MAIN ---
 
@@ -243,28 +264,29 @@ def get_transcript_data(ticker):
     for link in candidates[:3]:
         logger.info(f"🔗 Target: {link}")
         
-        # 1. Google Cache (Best)
-        text = fetch_google_cache(link)
-        if text: return text, {"source": "Investing.com (Cache)", "url": link, "title": "Earnings Call", "symbol": ticker}
-
-        # 2. Jina Reader (Reliable)
+        # Priority 1: Jina (Best for cleaning & bypass)
         text = fetch_jina_proxy(link)
         if text: return text, {"source": "Investing.com (Jina)", "url": link, "title": "Earnings Call", "symbol": ticker}
+
+        # Priority 2: Google Cache
+        text = fetch_google_cache(link)
+        if text: return text, {"source": "Investing.com (Cache)", "url": link, "title": "Earnings Call", "symbol": ticker}
         
-        # 3. Archive (Backup)
+        # Priority 3: Archive
         text = fetch_archive(link)
         if text: return text, {"source": "Investing.com (Archive)", "url": link, "title": "Earnings Call", "symbol": ticker}
 
-        # 4. Translate Proxy (Fallback)
+        # Priority 4: Translate Proxy
         text = fetch_translate(link)
         if text: return text, {"source": "Investing.com (Translate)", "url": link, "title": "Earnings Call", "symbol": ticker}
         
-        # 5. Direct (Last Resort)
+        # Priority 5: Direct
         text = fetch_direct(link)
         if text: return text, {"source": "Investing.com (Direct)", "url": link, "title": "Earnings Call", "symbol": ticker}
 
     return None, {"error": "All fetch methods failed."}
 
 if __name__ == "__main__":
+    # Test
     t, m = get_transcript_data("VWS.CO")
     if t: print(f"SUCCESS: {len(t)} chars")
