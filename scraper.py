@@ -3,32 +3,30 @@ import logging
 import urllib.parse
 import re
 import random
-import json
+import xml.etree.ElementTree as ET
 import requests as std_requests
 from bs4 import BeautifulSoup
 
 # --- 1. CONFIGURATION ---
-JINA_API_KEY = "jina_18edc5ecbee44fceb94ea05a675f2fd5NYFCvhRikOR-aCOpgK0KCRywSnaq"
-
 logger = logging.getLogger("Scraper")
 handler = logging.StreamHandler(sys.stderr)
 handler.setFormatter(logging.Formatter('[SCRAPER] %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Try curl_cffi for Direct Fetch & Bing Search
+# Try curl_cffi for Direct Fetch & Search (Crucial for bypassing blocks)
 try:
     from curl_cffi import requests as cffi_requests
     SESSION_TYPE = "cffi"
-    logger.info("✅ curl_cffi loaded.")
+    logger.info("✅ curl_cffi loaded (Stealth Mode).")
 except ImportError:
     SESSION_TYPE = "standard"
-    logger.warning("⚠️ curl_cffi not found. Bing strategy will be weaker.")
+    logger.warning("⚠️ curl_cffi not found. Falling back to standard requests (High Risk of Block).")
 
 # --- 2. SESSION FACTORY ---
 
 def get_cffi_session():
-    """Browser session for Direct Fetch / Search"""
+    """Browser session for Direct Fetch & Search"""
     ver = random.choice(["120", "124", "119"])
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
     
@@ -57,122 +55,113 @@ def resolve_name(ticker):
     }
     return mapping.get(t, t)
 
-# --- 3. SEARCH STRATEGIES ---
+# --- 3. SEARCH STRATEGIES (Dynamic Discovery) ---
 
-def search_jina(query):
-    """Strategy A: Jina Search (s.jina.ai) - Increased Timeout"""
-    try:
-        logger.info("   🔍 Strategy A: Jina Search...")
-        search_query = f"{query} site:investing.com earnings call transcript"
-        jina_search_url = f"https://s.jina.ai/{urllib.parse.quote(search_query)}"
-        
-        headers = {"Authorization": f"Bearer {JINA_API_KEY}", "X-Retain-Images": "none"}
-        
-        # INCREASED TIMEOUT to 60s
-        resp = std_requests.get(jina_search_url, headers=headers, timeout=60)
-        
-        if resp.status_code != 200:
-            logger.warning(f"      ↳ Jina Search Failed: {resp.status_code}")
-            return []
-            
-        urls = re.findall(r'\((https://www\.investing\.com/news/transcripts/[^\)]+)\)', resp.text)
-        return list(set(urls))
-    except Exception as e:
-        logger.warning(f"      ↳ Jina Error: {e}")
-        return []
-
-def search_archive_cdx(query, ticker):
+def search_google_rss(query):
     """
-    Strategy B: Archive.org CDX Index.
-    This bypasses search engines by querying the Wayback Machine's index of investing.com directly.
+    Strategy A: Google News RSS.
+    Why: RSS feeds are rarely IP-blocked compared to HTML search pages.
     """
     try:
-        logger.info("   🔍 Strategy B: Archive.org CDX Index...")
-        # Query for all transcript URLs under investing.com
-        cdx_url = "https://web.archive.org/cdx/search/cdx"
-        params = {
-            "url": "investing.com/news/transcripts/*",
-            "output": "json",
-            "collapse": "urlkey",
-            "limit": "3000",  # Get last 3000 transcripts indexed
-            "fl": "original"  # Field: original url
-        }
-        
-        resp = std_requests.get(cdx_url, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json() # Returns list of lists: [["original"], ["http..."], ...]
-            
-            candidates = []
-            # Normalize query parts (e.g., "Vestas" -> "vestas")
-            q_parts = query.lower().split()
-            ticker_clean = ticker.split('.')[0].lower()
-            
-            for row in data:
-                url = row[0]
-                url_lower = url.lower()
-                
-                # Check if URL matches the company
-                if ticker_clean in url_lower or any(q in url_lower for q in q_parts):
-                    candidates.append(url)
-            
-            logger.info(f"      ↳ CDX found {len(candidates)} matches.")
-            return candidates
-    except Exception as e:
-        logger.warning(f"      ↳ CDX Error: {e}")
-        return []
-    return []
-
-def search_bing(query):
-    """Strategy C: Bing HTML Search (via curl_cffi)"""
-    try:
-        logger.info("   🔍 Strategy C: Bing Search...")
-        url = "https://www.bing.com/search"
-        params = {'q': query + " site:investing.com earnings call transcript"}
+        logger.info("   🔍 Strategy A: Google News RSS...")
+        # Exact query structure to target Investing.com transcripts
+        q = f"{query} earnings call transcript site:investing.com"
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}"
         
         sess = get_cffi_session()
-        resp = sess.get(url, params=params, timeout=10)
+        resp = sess.get(rss_url, timeout=15)
+        
+        if resp.status_code != 200:
+            logger.warning(f"      ↳ RSS Blocked: {resp.status_code}")
+            return []
+            
+        # Parse XML
+        root = ET.fromstring(resp.content)
+        candidates = []
+        
+        for item in root.findall(".//item"):
+            title = item.find("title").text if item.find("title") is not None else ""
+            link = item.find("link").text if item.find("link") is not None else ""
+            
+            # Filter for actual transcripts
+            if "investing.com" in link and ("transcript" in title.lower() or "transcript" in link.lower()):
+                # Google RSS links are redirects; we'll resolve them later or use as is
+                candidates.append({"url": link, "title": title})
+                
+        return candidates
+    except Exception as e:
+        logger.warning(f"      ↳ RSS Error: {e}")
+        return []
+
+def search_investing_internal(query):
+    """
+    Strategy B: Investing.com Internal Search.
+    Why: Searching the source directly mimics a real user.
+    """
+    try:
+        logger.info("   🔍 Strategy B: Investing.com Internal Search...")
+        url = "https://www.investing.com/search/"
+        params = {"q": query}
+        
+        sess = get_cffi_session()
+        resp = sess.get(url, params=params, timeout=15)
         
         if resp.status_code != 200: return []
         
         soup = BeautifulSoup(resp.content, 'html.parser')
-        links = []
-        # Bing organic results often in <h2><a> or <div class="b_algo"><h2><a>
-        for h2 in soup.find_all('h2'):
-            a = h2.find('a', href=True)
-            if a:
-                l = a['href']
-                if "investing.com" in l and "transcript" in l.lower():
-                    links.append(l)
-        return list(set(links))
+        candidates = []
+        
+        # Parse 'News' or 'Analysis' sections
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            title = a.get_text().strip()
+            
+            if "/news/transcripts/" in href or ("transcript" in title.lower() and "/news/" in href):
+                full_url = href if href.startswith("http") else f"https://www.investing.com{href}"
+                candidates.append({"url": full_url, "title": title})
+                
+        return candidates
     except Exception as e:
-        logger.warning(f"      ↳ Bing Error: {e}")
+        logger.warning(f"      ↳ Internal Search Error: {e}")
         return []
 
 def get_candidates(ticker):
     name = resolve_name(ticker)
     logger.info(f"🔎 Searching for: {name}")
     
-    # 1. Try Jina
-    candidates = search_jina(name)
+    # 1. Google RSS (Most Robust)
+    candidates = search_google_rss(name)
     
-    # 2. Try Archive CDX (Very reliable fallback)
+    # 2. Internal Search (Fallback)
     if not candidates:
-        candidates = search_archive_cdx(name, ticker)
+        candidates = search_investing_internal(name)
+    
+    # Sort/Filter
+    # Prioritize "Q3 2025" or "2025"
+    unique_urls = []
+    seen = set()
+    
+    for c in candidates:
+        u = c['url']
+        if u in seen: continue
+        seen.add(u)
         
-    # 3. Try Bing
-    if not candidates:
-        candidates = search_bing(name)
+        score = 0
+        if "2025" in u or "2025" in c['title']: score += 10
+        if "Q3" in u or "Q3" in c['title']: score += 5
+        
+        unique_urls.append((score, u))
+        
+    unique_urls.sort(key=lambda x: x[0], reverse=True)
+    final_list = [x[1] for x in unique_urls]
     
-    # Sort by recency (Year/Quarter in URL)
-    candidates.sort(key=lambda x: x if "2025" in x else "0", reverse=True)
-    
-    if candidates: 
-        logger.info(f"✅ Found {len(candidates)} candidates.")
-        logger.info(f"   🌟 Top Pick: {candidates[0]}")
+    if final_list:
+        logger.info(f"✅ Found {len(final_list)} candidates.")
+        logger.info(f"   🌟 Top Pick: {final_list[0]}")
     else:
-        logger.warning("❌ No candidates found.")
+        logger.error("❌ No candidates found.")
         
-    return candidates
+    return final_list
 
 # --- 4. TEXT CLEANING & VALIDATION ---
 
@@ -183,66 +172,64 @@ def is_valid_content(text):
         "down for maintenance", 
         "Error 503", 
         "Access to this page has been denied", 
-        "Pardon Our Interruption"
+        "Pardon Our Interruption",
+        "Just a moment..."
     ]
     if any(flag in text for flag in error_flags): return False
     return True
 
 def clean_text(soup):
+    # Investing.com specific cleanup
     body = soup.find('div', class_='WYSIWYG') or soup.find('div', class_='articlePage') or soup.body
     if not body: return None
+    
     for tag in body(["script", "style", "iframe", "button", "figure", "aside", "nav", "footer"]): tag.decompose()
+    
+    # Remove ads and related links
     for div in body.find_all('div'):
-        if any(c in str(div.get('class', [])) for c in ['related', 'ad', 'share', 'img']): div.decompose()
+        if any(c in str(div.get('class', [])) for c in ['related', 'ad', 'share', 'img', 'discussion']): div.decompose()
+        
     text_parts = [p.get_text().strip() for p in body.find_all(['p', 'h2']) if len(p.get_text().strip()) > 30]
     return "\n\n".join(text_parts)
 
-# --- 5. FETCHING STRATEGIES ---
+# --- 5. FETCHING (With Redirect Handling) ---
 
-def fetch_jina_proxy(url):
+def fetch_content(url):
     try:
-        logger.info(f"   🤖 Trying Jina Reader...")
-        jina_url = f"https://r.jina.ai/{url}"
-        headers = {"Authorization": f"Bearer {JINA_API_KEY}", "X-Respond-With": "markdown", "X-No-Cache": "true"}
-        resp = std_requests.get(jina_url, headers=headers, timeout=40)
+        logger.info(f"   ⚡ Fetching: {url}")
+        sess = get_cffi_session()
+        
+        # Allow redirects (crucial for Google News links)
+        resp = sess.get(url, timeout=20, allow_redirects=True)
         
         if resp.status_code == 200:
-            text = resp.text
-            if not is_valid_content(text): 
-                logger.warning("      ↳ Jina Blocked/Maintenance.")
-                return None
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            text = clean_text(soup)
             
-            # Post-processing
-            for m in ["**Full transcript -", "Earnings call transcript:", "Participants"]:
-                if m in text: text = text[text.find(m):]; break
-            for m in ["Risk Disclosure:", "Fusion Media"]:
-                if m in text: text = text[:text.find(m)]; break
-            return text.strip()
-    except: pass
-    return None
-
-def fetch_google_cache(url):
-    try:
-        logger.info(f"   💾 Trying Google Cache...")
-        cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{urllib.parse.quote(url)}&strip=1&vwsrc=0"
-        sess = get_cffi_session()
-        resp = sess.get(cache_url, timeout=15)
-        if resp.status_code == 200:
-            text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
-            if is_valid_content(text): return text
-    except: pass
-    return None
-
-def fetch_direct(url):
-    try:
-        logger.info(f"   ⚡ Trying Direct Fetch...")
-        sess = get_cffi_session()
-        resp = sess.get(url, timeout=20)
-        if resp.status_code == 200:
-            text = clean_text(BeautifulSoup(resp.content, 'html.parser'))
-            if is_valid_content(text): return text
-    except: pass
-    return None
+            if is_valid_content(text):
+                # Clean header/footer noise
+                start_markers = ["**Full transcript -", "Earnings call transcript:", "Participants", "Operator"]
+                for m in start_markers:
+                    if m in text: 
+                        text = text[text.find(m):]
+                        break
+                
+                end_markers = ["Risk Disclosure:", "Fusion Media", "Comments"]
+                for m in end_markers:
+                    if m in text:
+                        text = text[:text.find(m)]
+                        break
+                        
+                return text.strip()
+            else:
+                logger.warning("      ↳ Content blocked or invalid (Maintenance Page).")
+        else:
+            logger.warning(f"      ↳ HTTP Error: {resp.status_code}")
+            
+        return None
+    except Exception as e:
+        logger.warning(f"      ↳ Fetch Error: {e}")
+        return None
 
 # --- 6. MAIN ---
 
@@ -251,21 +238,13 @@ def get_transcript_data(ticker):
     candidates = get_candidates(ticker)
     
     if not candidates:
-        return None, {"error": "No candidates found (All Search Methods Failed)"}
+        return None, {"error": "No candidates found via RSS or Internal Search"}
     
-    # Try top 3 candidates
-    for link in candidates[:3]:
-        logger.info(f"🔗 Target: {link}")
-        
-        text = fetch_jina_proxy(link)
-        if text: return text, {"source": "Investing.com (Jina)", "url": link}
-        
-        text = fetch_google_cache(link)
-        if text: return text, {"source": "Investing.com (Cache)", "url": link}
-        
-        text = fetch_direct(link)
-        if text: return text, {"source": "Investing.com (Direct)", "url": link}
-
+    for link in candidates[:3]: # Try top 3
+        text = fetch_content(link)
+        if text:
+            return text, {"source": "Investing.com", "url": link}
+            
     return None, {"error": "All fetch methods failed."}
 
 if __name__ == "__main__":
