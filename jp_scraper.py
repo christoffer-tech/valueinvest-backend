@@ -3,25 +3,25 @@ from bs4 import BeautifulSoup
 import re
 import time
 import random
-import pdfplumber
 import gc
-import tempfile
 import os
 import logging
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
-
-# --- 1. SILENCE PDF NOISE ---
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
+import fitz  # PyMuPDF
+import google.generativeai as genai
 
 # --- CONFIGURATION ---
-# We prioritize Transcripts first. If those don't exist, we try Presentations.
-# If Presentation is an image (fails), we fall back to Tanshin (Financial Results).
+# Configure Gemini API
+GENAI_KEY = os.environ.get("GEMINI_API_KEY")
+if GENAI_KEY:
+    genai.configure(api_key=GENAI_KEY)
+
 TYPE_PRIORITY = {
     "HTML_TRANSCRIPT": 1,
     "PDF_TRANSCRIPT": 2,
     "PDF_PRESENTATION": 3,
-    "PDF_TANSHIN": 4,  # This is usually the "Next Best" text source
+    "PDF_TANSHIN": 4,
     "OTHER": 99
 }
 
@@ -55,72 +55,92 @@ def parse_date_from_text(text):
             pass
     return None
 
-def format_doc_header(item):
+def format_doc_header(item, label_override=None):
     t = item['type']
-    label = "DOCUMENT"
-    if "TRANSCRIPT" in t:
-        label = "EARNINGS CALL TRANSCRIPT"
-    elif "PRESENTATION" in t:
-        label = "PRESENTATION SLIDES"
-    elif "TANSHIN" in t:
-        label = "FINANCIAL RESULTS (TANSHIN)"
+    label = label_override if label_override else "DOCUMENT"
+    if not label_override:
+        if "TRANSCRIPT" in t: label = "EARNINGS CALL TRANSCRIPT"
+        elif "PRESENTATION" in t: label = "PRESENTATION SLIDES"
+        elif "TANSHIN" in t: label = "FINANCIAL RESULTS (TANSHIN)"
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
-# --- STANDARD PDF EXTRACTOR (No OCR) ---
-def download_and_extract_pdf(url, log_func=print):
+# --- PYMUPDF TEXT EXTRACTOR ---
+def extract_text_from_pdf_bytes(pdf_bytes, log_func=print):
     text = ""
-    start_time = time.time()
-    
-    # SAFETY: Must be slightly less than Gunicorn --timeout (set to 120s)
-    MAX_EXECUTION_TIME = 90 
-    
-    temp_filename = None
-    
     try:
-        log_func(f"Streaming PDF to disk...")
-        with requests.get(url, headers=get_headers(), stream=True, timeout=30) as r:
-            r.raise_for_status()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
-                for chunk in r.iter_content(chunk_size=8192): 
-                    tf.write(chunk)
-                temp_filename = tf.name
-        
-        # Open with basic params
-        with pdfplumber.open(temp_filename) as pdf:
-            total_pages = len(pdf.pages)
-            log_func(f"PDF saved. Extracting all {total_pages} pages...")
-            
-            for i, page in enumerate(pdf.pages):
-                if time.time() - start_time > MAX_EXECUTION_TIME:
-                    log_func(f"⚠️ Time limit reached ({i}/{total_pages} pages). Returning partial text.")
-                    text += "\n[...Truncated: Server Time Limit Reached...]\n"
-                    break
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            # Check if PDF is encrypted or empty
+            if doc.is_encrypted:
+                log_func("⚠️ PDF is encrypted.")
+                return None
                 
-                try:
-                    # laparams helps with Japanese vertical text detection
-                    extracted = page.extract_text(laparams={"detect_vertical": True}) 
-                    if extracted:
-                        text += extracted + "\n"
-                except Exception as e:
-                    pass 
+            total_pages = len(doc)
+            log_func(f"   (PDF has {total_pages} pages)")
+            
+            for page in doc:
+                # flags=fitz.TEXT_PRESERVE_WHITESPACE helps with layout
+                extracted = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                if extracted:
+                    text += extracted + "\n"
+            
+            # Heuristic: If text is extremely short relative to page count, it's likely images
+            if len(text.strip()) < 100 and total_pages > 0:
+                log_func("⚠️ Extracted text is too short (likely image-based PDF).")
+                return None
                 
-                # CRITICAL: Free memory
-                page.flush_cache()
-                if i % 5 == 0: gc.collect()
-
     except Exception as e:
-        log_func(f"PDF Error: {e}")
-        
-    finally:
-        if temp_filename and os.path.exists(temp_filename):
-            try:
-                os.remove(temp_filename)
-            except: pass
-        gc.collect()
+        log_func(f"PyMuPDF Error: {e}")
+        return None
         
     return text
+
+# --- GEMINI VISION FALLBACK ---
+def process_vision_fallback(pdf_bytes, item, log_func=print):
+    """
+    Slices the first 15 pages of the PDF and sends them to Gemini 2.5 Flash
+    for direct analysis (OCR/Vision).
+    """
+    if not GENAI_KEY:
+        log_func("❌ Gemini API Key not found. Cannot perform vision fallback.")
+        return None
+
+    log_func(f"👀 Initiating Gemini Vision Fallback for {item['type']}...")
+
+    try:
+        # 1. Create a new PDF in memory with only the first 15 pages
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as src_doc:
+            last_page = min(15, len(src_doc)) - 1
+            src_doc.select(range(last_page + 1)) # Keep only first 15 pages
+            trimmed_bytes = src_doc.tobytes()
+            log_func(f"   Sliced PDF to first {last_page + 1} pages for analysis.")
+
+        # 2. Configure Model
+        model = genai.GenerativeModel('gemini-2.0-flash-exp') # Or 'gemini-1.5-flash' depending on access
+        
+        # 3. Prompt
+        prompt = (
+            "You are analyzing the first 15 slides of a Japanese financial presentation. "
+            "Extract the key financial results (Revenue, Operating Profit), strategic highlights, "
+            "and any forecasts for the next period. "
+            "Output the data as a clean text summary."
+        )
+
+        # 4. Generate
+        log_func("   Sending to Gemini...")
+        response = model.generate_content([
+            prompt,
+            {
+                "mime_type": "application/pdf",
+                "data": trimmed_bytes
+            }
+        ])
+        
+        return response.text
+
+    except Exception as e:
+        log_func(f"❌ Gemini Vision Error: {e}")
+        return None
 
 def stitch_html_transcript(item, log_func=print):
     full_text = []
@@ -280,74 +300,68 @@ def scrape_japanese_transcript(ticker):
             log("No items found on company page.")
             return None, logs
 
-        # --- NEW LOGIC: FALLBACK LOOP ---
+        # Sort: Latest date first, then by priority (Transcript < Presentation < Tanshin)
         items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
         latest_date = items[0]['date']
         
-        # Get all recent items (e.g., last 10 days from latest event)
-        window_start = latest_date - timedelta(days=10)
+        # Get all recent items (last 14 days from latest event)
+        window_start = latest_date - timedelta(days=14)
         candidates = [i for i in items if i['date'] >= window_start]
-        
-        # Sort by Priority: Transcript -> Presentation -> Tanshin
-        candidates.sort(key=lambda x: x['priority'])
+        candidates.sort(key=lambda x: x['priority']) # Sort by Priority
         
         final_text = ""
-        used_doc = None
+        best_pdf_for_fallback = None
+        best_pdf_bytes = None
         
-        # Iterate through candidates until we find one with valid text
+        # --- PHASE 1: Try to extract Pure Text ---
         for doc in candidates:
-            log(f"⬇️ Trying Candidate: {doc['type']} ({doc['date'].strftime('%Y-%m-%d')})")
+            log(f"⬇️ Processing Candidate: {doc['type']} ({doc['date'].strftime('%Y-%m-%d')})")
             
             try:
-                doc_text = ""
                 if doc['type'] == 'HTML_TRANSCRIPT':
-                    doc_text = stitch_html_transcript(doc, log)
+                    txt = stitch_html_transcript(doc, log)
+                    if txt and len(txt) > 200:
+                        final_text = format_doc_header(doc) + txt
+                        return final_text, logs
                 else:
-                    # PDF Download
-                    doc_text = download_and_extract_pdf(doc['url'], log)
-                
-                # CHECK: Did we actually get text?
-                if doc_text and len(doc_text.strip()) > 200:
-                    log(f"✅ Success! Extracted text from {doc['type']}.")
-                    header = format_doc_header(doc)
-                    final_text = header + doc_text
-                    used_doc = doc
-                    break # Stop looking, we found our data!
-                else:
-                    log(f"⚠️ {doc['type']} was empty/unreadable (likely image-based). Skipping to next candidate...")
-            
+                    # It's a PDF
+                    log(f"   Downloading PDF...")
+                    r = requests.get(doc['url'], headers=get_headers(), timeout=30)
+                    r.raise_for_status()
+                    pdf_data = r.content
+                    
+                    # Store as potential fallback if it's a Presentation/Tanshin
+                    if not best_pdf_for_fallback and doc['type'] in ['PDF_PRESENTATION', 'PDF_TANSHIN']:
+                        best_pdf_for_fallback = doc
+                        best_pdf_bytes = pdf_data
+                    
+                    # Try PyMuPDF Extraction
+                    txt = extract_text_from_pdf_bytes(pdf_data, log)
+                    if txt and len(txt) > 200:
+                        log(f"✅ Success! Extracted text from {doc['type']}.")
+                        final_text = format_doc_header(doc) + txt
+                        return final_text, logs
+                    
             except Exception as e:
-                log(f"❌ Failed to fetch {doc['type']}: {e}")
+                log(f"❌ Failed to process {doc['type']}: {e}")
                 continue
 
-        # If we found nothing in recent docs, check for historical transcript as context
-        if not final_text:
-             log("❌ All recent candidates failed text extraction.")
-             return None, logs
+        # --- PHASE 2: Fallback (Vision Analysis) ---
+        # If we are here, we have no text. 
+        # If we have a stored PDF (Presentation/Tanshin), send slides to Gemini.
+        if best_pdf_for_fallback and best_pdf_bytes:
+            log("⚠️ Text extraction failed for all docs. Attempting Gemini Vision fallback...")
+            
+            vision_text = process_vision_fallback(best_pdf_bytes, best_pdf_for_fallback, log)
+            
+            if vision_text:
+                header = format_doc_header(best_pdf_for_fallback, label_override="VISION ANALYSIS OF SLIDES")
+                final_text = header + vision_text
+                return final_text, logs
+            else:
+                log("❌ Vision fallback failed or produced no output.")
 
-        # Optional: Append a historical transcript for context if the main doc was short (e.g. Tanshin)
-        # Only do this if we are not already using a transcript
-        if used_doc and used_doc['type'] != 'HTML_TRANSCRIPT' and used_doc['type'] != 'PDF_TRANSCRIPT':
-             transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
-             transcripts.sort(key=lambda x: x['date'], reverse=True)
-             
-             for tx in transcripts:
-                 days_diff = (used_doc['date'] - tx['date']).days
-                 if 60 < days_diff < 250:
-                     log(f"➕ Adding Historical Context: {tx['type']} ({days_diff} days ago)")
-                     try:
-                         context_text = ""
-                         if tx['type'] == 'HTML_TRANSCRIPT':
-                            context_text = stitch_html_transcript(tx, log)
-                         else:
-                            context_text = download_and_extract_pdf(tx['url'], log)
-                            
-                         if context_text and len(context_text) > 200:
-                             final_text += format_doc_header(tx) + context_text
-                             break
-                     except: pass
-
-        return final_text, logs
+        return None, logs
             
     except Exception as e:
         log(f"Global Scraper Error: {e}")
