@@ -11,6 +11,14 @@ import logging
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
 
+# --- OCR LIBRARIES (STEP 2) ---
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
 # --- 1. SILENCE PDF NOISE ---
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
@@ -65,7 +73,7 @@ def format_doc_header(item):
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
-# --- MEMORY OPTIMIZED DOWNLOADER ---
+# --- MEMORY OPTIMIZED DOWNLOADER WITH OCR FALLBACK ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
@@ -85,29 +93,59 @@ def download_and_extract_pdf(url, log_func=print):
                     tf.write(chunk)
                 temp_filename = tf.name
         
-        # Open with basic params
+        # --- STEP 1: Standard Extraction (Fast) ---
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            log_func(f"PDF saved. Extracting all {total_pages} pages...")
+            log_func(f"PDF saved. Extracting all {total_pages} pages (Standard)...")
             
             for i, page in enumerate(pdf.pages):
-                # Safety Valve: Return what we have instead of crashing
                 if time.time() - start_time > MAX_EXECUTION_TIME:
                     log_func(f"⚠️ Time limit reached ({i}/{total_pages} pages). Returning partial text.")
                     text += "\n[...Truncated: Server Time Limit Reached...]\n"
                     break
                 
                 try:
-                    # laparams helps with Japanese vertical text detection
                     extracted = page.extract_text(laparams={"detect_vertical": True}) 
                     if extracted:
                         text += extracted + "\n"
                 except Exception as e:
-                    pass # Skip complex pages silently
+                    pass 
                 
-                # CRITICAL: Free memory
                 page.flush_cache()
                 if i % 5 == 0: gc.collect()
+
+        # --- STEP 2: OCR Fallback (Slow, for Image PDFs) ---
+        # If we have very little text (< 50 chars), assume it's an image-based PDF
+        if len(text.strip()) < 50:
+            if OCR_AVAILABLE:
+                log_func("⚠️ Standard extraction failed (Image PDF). Attempting OCR (Step 2)...")
+                try:
+                    # Convert PDF to images
+                    # Note: limit to first 10-15 pages to prevent timeouts on large decks
+                    images = convert_from_path(temp_filename, last_page=15)
+                    
+                    ocr_text = ""
+                    for i, image in enumerate(images):
+                        if time.time() - start_time > MAX_EXECUTION_TIME:
+                            ocr_text += "\n[...OCR Truncated: Time Limit...]\n"
+                            break
+                            
+                        # Try Japanese + English
+                        page_str = pytesseract.image_to_string(image, lang='jpn+eng')
+                        ocr_text += f"\n--- Page {i+1} (OCR) ---\n{page_str}\n"
+                    
+                    if len(ocr_text.strip()) > 0:
+                        text = ocr_text
+                        log_func(f"✅ OCR successful. Extracted {len(text)} characters.")
+                    else:
+                        log_func("❌ OCR yielded no text.")
+
+                except Exception as e:
+                    log_func(f"❌ OCR Error: {e} (Check poppler/tesseract installation)")
+            else:
+                log_func("⚠️ PDF is image-based but OCR libraries (pytesseract/pdf2image) are missing.")
+                text += "\n[ERROR: This document is an image-based PDF. Text extraction failed.]\n"
+                text += f"Link to original: {url}\n"
 
     except Exception as e:
         log_func(f"PDF Error: {e}")
@@ -321,8 +359,15 @@ def scrape_japanese_transcript(ticker):
                     log(f"Downloading PDF ({doc['type']})...")
                     doc_text = download_and_extract_pdf(doc['url'], log)
 
-                if doc_text:
+                # --- VALIDATION CHECK ---
+                if doc_text and len(doc_text.strip()) > 50:
                     final_output += header + doc_text
+                else:
+                    # Logic: If it failed here, it failed both PDFMiner AND OCR
+                    log(f"⚠️ Warning: {doc['type']} returned empty text even after OCR attempts.")
+                    final_output += header + "\n[WARNING: No text could be extracted from this document.]\n"
+                    final_output += f"Please view original: {doc['url']}\n"
+
             except Exception as e:
                 log(f"Failed to fetch {doc['type']}: {e}")
 
