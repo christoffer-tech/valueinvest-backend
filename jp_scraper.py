@@ -11,23 +11,17 @@ import logging
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
 
-# --- OCR LIBRARIES (STEP 2) ---
-try:
-    import pytesseract
-    from pdf2image import convert_from_path
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-
 # --- 1. SILENCE PDF NOISE ---
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
+# We prioritize Transcripts first. If those don't exist, we try Presentations.
+# If Presentation is an image (fails), we fall back to Tanshin (Financial Results).
 TYPE_PRIORITY = {
     "HTML_TRANSCRIPT": 1,
     "PDF_TRANSCRIPT": 2,
     "PDF_PRESENTATION": 3,
-    "PDF_TANSHIN": 4,
+    "PDF_TANSHIN": 4,  # This is usually the "Next Best" text source
     "OTHER": 99
 }
 
@@ -73,13 +67,13 @@ def format_doc_header(item):
         
     return f"\n\n{'='*40}\n=== {label} ===\nDATE: {item['date'].strftime('%Y-%m-%d')}\nTYPE: {t}\n{'='*40}\n"
 
-# --- MEMORY OPTIMIZED DOWNLOADER WITH OCR FALLBACK ---
+# --- STANDARD PDF EXTRACTOR (No OCR) ---
 def download_and_extract_pdf(url, log_func=print):
     text = ""
     start_time = time.time()
     
     # SAFETY: Must be slightly less than Gunicorn --timeout (set to 120s)
-    MAX_EXECUTION_TIME = 100 
+    MAX_EXECUTION_TIME = 90 
     
     temp_filename = None
     
@@ -93,10 +87,10 @@ def download_and_extract_pdf(url, log_func=print):
                     tf.write(chunk)
                 temp_filename = tf.name
         
-        # --- STEP 1: Standard Extraction (Fast) ---
+        # Open with basic params
         with pdfplumber.open(temp_filename) as pdf:
             total_pages = len(pdf.pages)
-            log_func(f"PDF saved. Extracting all {total_pages} pages (Standard)...")
+            log_func(f"PDF saved. Extracting all {total_pages} pages...")
             
             for i, page in enumerate(pdf.pages):
                 if time.time() - start_time > MAX_EXECUTION_TIME:
@@ -105,47 +99,16 @@ def download_and_extract_pdf(url, log_func=print):
                     break
                 
                 try:
+                    # laparams helps with Japanese vertical text detection
                     extracted = page.extract_text(laparams={"detect_vertical": True}) 
                     if extracted:
                         text += extracted + "\n"
                 except Exception as e:
                     pass 
                 
+                # CRITICAL: Free memory
                 page.flush_cache()
                 if i % 5 == 0: gc.collect()
-
-        # --- STEP 2: OCR Fallback (Slow, for Image PDFs) ---
-        # If we have very little text (< 50 chars), assume it's an image-based PDF
-        if len(text.strip()) < 50:
-            if OCR_AVAILABLE:
-                log_func("⚠️ Standard extraction failed (Image PDF). Attempting OCR (Step 2)...")
-                try:
-                    # Convert PDF to images
-                    # Note: limit to first 10-15 pages to prevent timeouts on large decks
-                    images = convert_from_path(temp_filename, last_page=15)
-                    
-                    ocr_text = ""
-                    for i, image in enumerate(images):
-                        if time.time() - start_time > MAX_EXECUTION_TIME:
-                            ocr_text += "\n[...OCR Truncated: Time Limit...]\n"
-                            break
-                            
-                        # Try Japanese + English
-                        page_str = pytesseract.image_to_string(image, lang='jpn+eng')
-                        ocr_text += f"\n--- Page {i+1} (OCR) ---\n{page_str}\n"
-                    
-                    if len(ocr_text.strip()) > 0:
-                        text = ocr_text
-                        log_func(f"✅ OCR successful. Extracted {len(text)} characters.")
-                    else:
-                        log_func("❌ OCR yielded no text.")
-
-                except Exception as e:
-                    log_func(f"❌ OCR Error: {e} (Check poppler/tesseract installation)")
-            else:
-                log_func("⚠️ PDF is image-based but OCR libraries (pytesseract/pdf2image) are missing.")
-                text += "\n[ERROR: This document is an image-based PDF. Text extraction failed.]\n"
-                text += f"Link to original: {url}\n"
 
     except Exception as e:
         log_func(f"PDF Error: {e}")
@@ -317,61 +280,74 @@ def scrape_japanese_transcript(ticker):
             log("No items found on company page.")
             return None, logs
 
+        # --- NEW LOGIC: FALLBACK LOOP ---
         items.sort(key=lambda x: (x['date'], -x['priority']), reverse=True)
         latest_date = items[0]['date']
         
+        # Get all recent items (e.g., last 10 days from latest event)
         window_start = latest_date - timedelta(days=10)
-        recent_candidates = [i for i in items if i['date'] >= window_start]
+        candidates = [i for i in items if i['date'] >= window_start]
         
-        recent_candidates.sort(key=lambda x: x['priority'])
+        # Sort by Priority: Transcript -> Presentation -> Tanshin
+        candidates.sort(key=lambda x: x['priority'])
         
-        current_winner = recent_candidates[0]
-        log(f"✅ Primary: {current_winner['type']} ({current_winner['date'].strftime('%Y-%m-%d')})")
-
-        secondary_doc = None
+        final_text = ""
+        used_doc = None
         
-        transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
-        transcripts.sort(key=lambda x: x['date'], reverse=True)
-        
-        if transcripts:
-            for tx in transcripts:
-                days_diff = (current_winner['date'] - tx['date']).days
-                if 60 < days_diff < 250:
-                    secondary_doc = tx
-                    log(f"✅ Context: {secondary_doc['type']} (Historical from {days_diff} days ago)")
-                    break
-
-        final_output = ""
-        
-        docs_to_fetch = [current_winner]
-        if secondary_doc:
-            docs_to_fetch.append(secondary_doc)
-
-        for doc in docs_to_fetch:
+        # Iterate through candidates until we find one with valid text
+        for doc in candidates:
+            log(f"⬇️ Trying Candidate: {doc['type']} ({doc['date'].strftime('%Y-%m-%d')})")
+            
             try:
-                gc.collect()
                 doc_text = ""
-                header = format_doc_header(doc)
-                
                 if doc['type'] == 'HTML_TRANSCRIPT':
                     doc_text = stitch_html_transcript(doc, log)
                 else:
-                    log(f"Downloading PDF ({doc['type']})...")
+                    # PDF Download
                     doc_text = download_and_extract_pdf(doc['url'], log)
-
-                # --- VALIDATION CHECK ---
-                if doc_text and len(doc_text.strip()) > 50:
-                    final_output += header + doc_text
+                
+                # CHECK: Did we actually get text?
+                if doc_text and len(doc_text.strip()) > 200:
+                    log(f"✅ Success! Extracted text from {doc['type']}.")
+                    header = format_doc_header(doc)
+                    final_text = header + doc_text
+                    used_doc = doc
+                    break # Stop looking, we found our data!
                 else:
-                    # Logic: If it failed here, it failed both PDFMiner AND OCR
-                    log(f"⚠️ Warning: {doc['type']} returned empty text even after OCR attempts.")
-                    final_output += header + "\n[WARNING: No text could be extracted from this document.]\n"
-                    final_output += f"Please view original: {doc['url']}\n"
-
+                    log(f"⚠️ {doc['type']} was empty/unreadable (likely image-based). Skipping to next candidate...")
+            
             except Exception as e:
-                log(f"Failed to fetch {doc['type']}: {e}")
+                log(f"❌ Failed to fetch {doc['type']}: {e}")
+                continue
 
-        return final_output if final_output else None, logs
+        # If we found nothing in recent docs, check for historical transcript as context
+        if not final_text:
+             log("❌ All recent candidates failed text extraction.")
+             return None, logs
+
+        # Optional: Append a historical transcript for context if the main doc was short (e.g. Tanshin)
+        # Only do this if we are not already using a transcript
+        if used_doc and used_doc['type'] != 'HTML_TRANSCRIPT' and used_doc['type'] != 'PDF_TRANSCRIPT':
+             transcripts = [i for i in items if i['type'] in ['HTML_TRANSCRIPT', 'PDF_TRANSCRIPT']]
+             transcripts.sort(key=lambda x: x['date'], reverse=True)
+             
+             for tx in transcripts:
+                 days_diff = (used_doc['date'] - tx['date']).days
+                 if 60 < days_diff < 250:
+                     log(f"➕ Adding Historical Context: {tx['type']} ({days_diff} days ago)")
+                     try:
+                         context_text = ""
+                         if tx['type'] == 'HTML_TRANSCRIPT':
+                            context_text = stitch_html_transcript(tx, log)
+                         else:
+                            context_text = download_and_extract_pdf(tx['url'], log)
+                            
+                         if context_text and len(context_text) > 200:
+                             final_text += format_doc_header(tx) + context_text
+                             break
+                     except: pass
+
+        return final_text, logs
             
     except Exception as e:
         log(f"Global Scraper Error: {e}")
