@@ -13,4 +13,3 @@ pdf2image
 pytesseract
 Pillow
 pymupdf
-google-generativeai
